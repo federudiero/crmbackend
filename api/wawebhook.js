@@ -1,6 +1,7 @@
 // crm-backend/api/waWebhook.js
 import { db, FieldValue } from "../lib/firebaseAdmin.js";
 
+// crm-backend/api/waWebhook.js
 export default async function handler(req, res) {
   if (req.method === "GET") {
     // Verificación del webhook (Meta → "hub.challenge")
