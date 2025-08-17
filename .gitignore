@@ -1,0 +1,22 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Vercel
+.vercel
+
+# Build
+dist/
+build/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# NUNCA subir claves
+*.json
+# o si preferís solo ese archivo:
+# crmsistem-d3009-firebase-adminsdk-fbsvc-993e9a84c3.json
