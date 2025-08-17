@@ -119,7 +119,7 @@ export default async function handler(req, res) {
       raw: data,
     });
 
-    return res.status(200).json({ ok: true, id: waMessageId, to: toSanitized });
+    return res.status(200).json({ ok: true, id: waMessageId,to: toSanitized.replace(/^\+/, ""), });
   } catch (e) {
     console.error("sendMessage error:", e);
     return res.status(500).json({ error: "internal_error" });
