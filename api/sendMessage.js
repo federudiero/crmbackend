@@ -1,9 +1,9 @@
 // api/sendMessage.js
 import { db, FieldValue } from "../lib/firebaseAdmin.js";
 
-const GRAPH_BASE = "https://graph.facebook.com/v20.0";
+const GRAPH_BASE = "https://graph.facebook.com/v23.0";
 const PHONE_ID = process.env.META_WA_PHONE_ID;
-const TOKEN = process.env.META_WA_TOKEN;
+const TOKEN    = process.env.META_WA_TOKEN;
 
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -11,111 +11,130 @@ function cors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
-// --- Helpers de normalización para Argentina ---
-function digits(s) { return String(s || "").replace(/\D/g, ""); }
+const digits = (s) => String(s || "").replace(/\D/g, "");
 
-// E.164 móvil AR sin '+' -> 549AAAXXXXXXX
-function to549(raw) {
-  let d = digits(raw);
-  // quitar 00 internacional
-  if (d.startsWith("00")) d = d.slice(2);
-  // quitar código país si viene repetido
-  if (d.startsWith("54")) d = d.slice(2);
-  // quitar 0 de área
-  if (d.startsWith("0")) d = d.slice(1);
-  // quitar '15' después del área (heurística: área 2-4 dígitos)
-  d = d.replace(/^(\d{2,4})15/, "$1");
-  // asegurar móvil con '9' delante
-  if (!d.startsWith("9")) d = "9" + d;
-  return "54" + d; // 549...
+/**
+ * Genera candidatos para Argentina:
+ *  A) 549 + area + numero                  (celular E.164)
+ *  B) 54 + area + 15 + numero              (formato sandbox que a veces guarda Meta)
+ * También respeta si ya viene 54... tal cual y genera el alternativo.
+ */
+function candidatesAR(toRaw) {
+  const d0 = digits(toRaw);
+
+  // Si ya viene con 54... usamos eso como primario y construimos el alternativo
+  if (d0.startsWith("54")) {
+    const out = [d0];
+    // alternar 549 <-> 54 + 15
+    if (/^549(\d{3})(\d+)$/.test(d0)) {
+      const [, area, rest] = d0.match(/^549(\d{3})(\d+)$/);
+      out.push(`54${area}15${rest}`);
+    } else if (/^54(\d{3})15(\d+)$/.test(d0)) {
+      const [, area, rest] = d0.match(/^54(\d{3})15(\d+)$/);
+      out.push(`549${area}${rest}`);
+    }
+    return Array.from(new Set(out));
+  }
+
+  // Caso local: 0? area (2-4) + numero
+  let d = d0;
+  if (d.startsWith("00")) d = d.slice(2); // 00 internacional
+  if (d.startsWith("0"))  d = d.slice(1); // 0 de área
+
+  // Heurística simple para área (3 es muy común: Córdoba 351, CABA 11 es 2)
+  let areaLen = 3;
+  if (/^11\d{8}$/.test(d)) areaLen = 2; // CABA
+  const area = d.slice(0, areaLen);
+  const local = d.slice(areaLen);
+
+  const cand549  = `549${area}${local}`;
+  const cand5415 = `54${area}${local.startsWith("15") ? local : `15${local}`}`;
+
+  return [cand549, cand5415];
 }
 
-// Variante “54 + área + 15 + número” (como muestra Meta en el Getting Started)
-function to5415(raw) {
-  let d = digits(raw);
-  if (d.startsWith("00")) d = d.slice(2);
-  if (d.startsWith("54")) d = d.slice(2);
-  if (d.startsWith("0")) d = d.slice(1);
-  // heurística de área: 3 dígitos (p.ej. 351). Si no alcanza, usa 2.
-  let areaLen = d.length >= 10 ? 3 : 2;
-  const area = d.slice(0, areaLen);
-  let local = d.slice(areaLen);
-  // si ya venía con 15 al comienzo del local, no dupliques
-  if (!local.startsWith("15")) local = "15" + local;
-  return "54" + area + local;
+async function sendToGraph(to, payload) {
+  const url = `${GRAPH_BASE}/${PHONE_ID}/messages`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ messaging_product: "whatsapp", to, ...payload }),
+  });
+  const json = await res.json();
+  return { ok: res.ok, status: res.status, json };
 }
 
 export default async function handler(req, res) {
-  if (req.method === "OPTIONS") { cors(res); return res.status(204).send(""); }
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  cors(res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
   try {
-    cors(res);
-
     if (!PHONE_ID || !TOKEN) {
-      return res.status(500).json({ error: "missing_env", detail: "META_WA_PHONE_ID o META_WA_TOKEN no configurados" });
+      return res.status(500).json({ error: "server_misconfigured" });
     }
 
     const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
-    const { to, text, conversationId } = body;
-    if (!to || !text) return res.status(400).json({ error: "to y text son requeridos" });
+    let   { to, text, template, conversationId } = body;
 
-    // 1) intento con 549... (sin '+', solo dígitos)
-    const to549Digits = to549(to);               // ej: 5493512602142
-    const url = `${GRAPH_BASE}/${PHONE_ID}/messages`;
-    const payload = {
-      messaging_product: "whatsapp",
-      to: to549Digits,
-      type: "text",
-      text: { preview_url: false, body: text },
-    };
+    // Validaciones
+    if (!to)   return res.status(400).json({ error: "missing_to" });
+    if (!text && !template) return res.status(400).json({ error: "missing_text_or_template" });
 
-    let r = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    let data = await r.json();
+    // Normalizamos a array para soportar 1..N destinatarios
+    const recipients = Array.isArray(to) ? to : [to];
+    const results = [];
 
-    // 2) si falla con 131030, reintenta con 54 + area + 15 + número
-    if (!r.ok && data?.error?.code === 131030) {
-      const to5415Digits = to5415(to);           // ej: 54351152602142
-      const payloadAlt = { ...payload, to: to5415Digits };
-      r = await fetch(url, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify(payloadAlt),
-      });
-      data = await r.json();
+    for (const raw of recipients) {
+      const cands = candidatesAR(raw);
+
+      let delivered = null, usedTo = null, lastErr = null;
+      for (const cand of cands) {
+        const payload = template
+          ? { type: "template", template } // { name, language: { code }, components? }
+          : { type: "text", text: { body: typeof text === "string" ? text : text?.body, preview_url: false } };
+
+        const r = await sendToGraph(cand, payload);
+        if (r.ok) { delivered = r.json; usedTo = cand; break; }
+
+        const code = r?.json?.error?.code;
+        lastErr = r.json;
+        if (code !== 131030) break; // si no es “no permitido”, no tiene sentido probar el alternativo
+      }
+
+      if (delivered) {
+        // Guardamos en Firestore
+        const convId = conversationId || `+${usedTo}`;
+        const convRef = db.collection("conversations").doc(convId);
+        await convRef.set(
+          { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
+          { merge: true }
+        );
+        const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
+        await convRef.collection("messages").doc(wamid).set({
+          direction: "out",
+          type: template ? "template" : "text",
+          text: template ? undefined : (typeof text === "string" ? text : text?.body),
+          template: template?.name ?? undefined,
+          timestamp: new Date(),
+          status: "accepted",
+          to: `+${usedTo}`,
+          raw: delivered,
+        });
+
+        results.push({ to: `+${usedTo}`, ok: true, id: wamid });
+      } else {
+        results.push({ to: raw, ok: false, error: lastErr || { message: "send_failed" } });
+      }
     }
 
-    if (!r.ok) {
-      console.error("WA send error:", JSON.stringify(data));
-      return res.status(400).json({ error: data });
-    }
-
-    // Persistimos mensaje saliente
-    const convId = conversationId || `+${to549Digits}`; // guarda en +549...
-    const convRef = db.collection("conversations").doc(convId);
-    await convRef.set(
-      { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
-      { merge: true }
-    );
-
-    const waMessageId = data?.messages?.[0]?.id || `out_${Date.now()}`;
-    await convRef.collection("messages").doc(waMessageId).set({
-      direction: "out",
-      type: "text",
-      text,
-      timestamp: new Date(),
-      status: "sent",
-      to: `+${to549Digits}`,
-      raw: data,
-    });
-
-    return res.status(200).json({ ok: true, id: waMessageId, to: `+${to549Digits}` });
-  } catch (e) {
-    console.error("sendMessage error:", e);
+    // HTTP 207 semántico (pero devolvemos 200 con detalle)
+    return res.status(200).json({ ok: results.every(r => r.ok), results });
+  } catch (err) {
+    console.error("sendMessage error:", err);
     return res.status(500).json({ error: "internal_error" });
   }
 }
