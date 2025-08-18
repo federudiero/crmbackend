@@ -99,6 +99,7 @@ export default async function handler(req, res) {
 
         const r = await sendToGraph(cand, payload);
         if (r.ok) { delivered = r.json; usedTo = cand; break; }
+console.log("Meta send response:", JSON.stringify(r, null, 2));
 
         const code = r?.json?.error?.code;
         lastErr = r.json;
