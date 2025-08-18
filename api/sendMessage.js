@@ -4,7 +4,8 @@ import { db, FieldValue } from "../lib/firebaseAdmin.js";
 const GRAPH_BASE = "https://graph.facebook.com/v23.0";
 const PHONE_ID = process.env.META_WA_PHONE_ID;
 const TOKEN    = process.env.META_WA_TOKEN;
-
+// Si estás en sandbox y Meta guarda “+54 (área) 15 (local)”, poné 1
+const PREFER_5415 = String(process.env.META_WA_PREFER_5415 || "") === "1";
 
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -19,7 +20,6 @@ const digits = (s) => String(s || "").replace(/\D/g, "");
 function normalizeE164AR(raw) {
   let d = digits(raw);
   if (d.startsWith("549")) return `+${d}`;
-
   const m = d.match(/^54(\d{2,4})15(\d+)$/);
   if (m) {
     const [, area, local] = m;
@@ -33,10 +33,8 @@ function normalizeE164AR(raw) {
 
 /**
  * Genera candidatos de envío para AR:
- * - Si ya viene 54..15.. probamos [54..15.., 549..] (sandbox suele guardar así)
- * - Si viene 549.. probamos [549.., 54..15..]
- * - Si es local o ambiguo, [549.., 54..15..]
- * Todos SIN '+' porque el Graph acepta dígitos.
+ * - 54..15.. y 549.. (en ese orden si PREFER_5415=1)
+ * - siempre SIN '+'
  */
 function candidatesForSendAR(toRaw) {
   const d0 = digits(toRaw);
@@ -44,27 +42,27 @@ function candidatesForSendAR(toRaw) {
   const m5415 = d0.match(/^54(\d{2,4})15(\d+)$/);
   if (m5415) {
     const [, area, rest] = m5415;
-    return [d0, `549${area}${rest}`]; // prioriza 54..15.. (lista “allowed” del sandbox)
+    return PREFER_5415 ? [d0, `549${area}${rest}`] : [`549${area}${rest}`, d0];
   }
 
   const m549 = d0.match(/^549(\d{2,4})(\d+)$/);
   if (m549) {
     const [, area, rest] = m549;
-    return [d0, `54${area}15${rest}`];
+    return PREFER_5415 ? [`54${area}15${rest}`, d0] : [d0, `54${area}15${rest}`];
   }
 
-  // Local/otro: intentamos construir ambas
+  // Local/otro: construyo ambas
   let d = d0;
   if (d.startsWith("00")) d = d.slice(2);
   d = d.replace(/^0+/, "");
-
-  // área 2 (CABA 11) o 3 (resto) – simplificado
   let areaLen = 3;
-  if (/^11\d{8}$/.test(d)) areaLen = 2;
+  if (/^11\d{8}$/.test(d)) areaLen = 2; // CABA
   const area  = d.slice(0, areaLen);
   const local = d.slice(areaLen);
 
-  return [`549${area}${local}`, `54${area}15${local}`];
+  return PREFER_5415
+    ? [`54${area}15${local}`, `549${area}${local}`]
+    : [`549${area}${local}`, `54${area}15${local}`];
 }
 
 async function sendToGraph(toDigits, payload) {
@@ -130,8 +128,7 @@ export default async function handler(req, res) {
 
         lastErr = r.json;
         const code = r?.json?.error?.code;
-        // Si es “not in allowed list” (131030) probamos el siguiente candidato;
-        // cualquier otro error cortamos el intento.
+        // 131030 = not in allowed list (sandbox) -> probamos el siguiente
         if (code !== 131030) break;
       }
 
