@@ -84,7 +84,7 @@ export default async function handler(req, res) {
     if (!to)   return res.status(400).json({ error: "missing_to" });
     if (!text && !template) return res.status(400).json({ error: "missing_text_or_template" });
 
-    // Normalizamos a array para soportar 1..N destinatarios
+    // 1..N destinatarios
     const recipients = Array.isArray(to) ? to : [to];
     const results = [];
 
@@ -92,48 +92,55 @@ export default async function handler(req, res) {
       const cands = candidatesAR(raw);
 
       let delivered = null, usedTo = null, lastErr = null;
+
+      // intentamos con los candidatos (549..., 54..15...)
       for (const cand of cands) {
         const payload = template
           ? { type: "template", template } // { name, language: { code }, components? }
           : { type: "text", text: { body: typeof text === "string" ? text : text?.body, preview_url: false } };
 
         const r = await sendToGraph(cand, payload);
+        console.log("WA send", { cand, ok: r.ok, status: r.status, json: r.json });
+
         if (r.ok) { delivered = r.json; usedTo = cand; break; }
-console.log("Meta send response:", JSON.stringify(r, null, 2));
 
         const code = r?.json?.error?.code;
         lastErr = r.json;
-        // 131030 = "Unsupported number format / not allowed" → probamos el alternativo
+        // 131030 = formato no permitido; probamos el alternativo. Otros errores: no insistir.
         if (code !== 131030) break;
       }
 
+      // === Guardar SIEMPRE (éxito o error) ===
+      const convId = `+${usedTo || cands[0]}`;
+      const convRef = db.collection("conversations").doc(convId);
+
+      await convRef.set(
+        { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+
+      const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
+
+      const msgDoc = {
+        direction: "out",
+        type: template ? "template" : "text",
+        text: template ? undefined : (typeof text === "string" ? text : text?.body),
+        template: template?.name ?? undefined,
+        timestamp: FieldValue.serverTimestamp(),
+        to: convId,
+      };
+
       if (delivered) {
-        // Conversación SIEMPRE = número realmente usado para enviar
-        const convId = `+${usedTo}`;
-        const convRef = db.collection("conversations").doc(convId);
-
-        await convRef.set(
-          { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
-          { merge: true }
-        );
-
-        const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
-
-        await convRef.collection("messages").doc(wamid).set({
-          direction: "out",
-          type: template ? "template" : "text",
-          text: template ? undefined : (typeof text === "string" ? text : text?.body),
-          template: template?.name ?? undefined,
-          timestamp: FieldValue.serverTimestamp(),
-          status: "accepted",
-          to: convId,
-          raw: delivered,
-        });
-
-        results.push({ to: convId, ok: true, id: wamid });
+        msgDoc.status = "sent";    // si tu UI prefiere 'accepted', cambialo aquí
+        msgDoc.raw = delivered;
       } else {
-        results.push({ to: raw, ok: false, error: lastErr || { message: "send_failed" } });
+        msgDoc.status = "error";
+        msgDoc.error = lastErr || { message: "send_failed" };
       }
+
+      await convRef.collection("messages").doc(wamid).set(msgDoc);
+
+      results.push({ to: convId, ok: !!delivered, id: wamid, error: msgDoc.error });
     }
 
     return res.status(200).json({ ok: results.every(r => r.ok), results });
