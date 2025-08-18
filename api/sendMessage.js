@@ -41,7 +41,7 @@ function candidatesAR(toRaw) {
   if (d.startsWith("00")) d = d.slice(2); // 00 internacional
   if (d.startsWith("0"))  d = d.slice(1); // 0 de área
 
-  // Heurística simple para área (3 es muy común: Córdoba 351, CABA 11 es 2)
+  // Heurística simple para área
   let areaLen = 3;
   if (/^11\d{8}$/.test(d)) areaLen = 2; // CABA
   const area = d.slice(0, areaLen);
@@ -78,7 +78,7 @@ export default async function handler(req, res) {
     }
 
     const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
-    let   { to, text, template, conversationId } = body;
+    let   { to, text, template } = body;
 
     // Validaciones
     if (!to)   return res.status(400).json({ error: "missing_to" });
@@ -102,36 +102,39 @@ export default async function handler(req, res) {
 
         const code = r?.json?.error?.code;
         lastErr = r.json;
-        if (code !== 131030) break; // si no es “no permitido”, no tiene sentido probar el alternativo
+        // 131030 = "Unsupported number format / not allowed" → probamos el alternativo
+        if (code !== 131030) break;
       }
 
       if (delivered) {
-        // Guardamos en Firestore
-        const convId = conversationId || `+${usedTo}`;
+        // Conversación SIEMPRE = número realmente usado para enviar
+        const convId = `+${usedTo}`;
         const convRef = db.collection("conversations").doc(convId);
+
         await convRef.set(
           { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
           { merge: true }
         );
+
         const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
+
         await convRef.collection("messages").doc(wamid).set({
           direction: "out",
           type: template ? "template" : "text",
           text: template ? undefined : (typeof text === "string" ? text : text?.body),
           template: template?.name ?? undefined,
-          timestamp: new Date(),
+          timestamp: FieldValue.serverTimestamp(),
           status: "accepted",
-          to: `+${usedTo}`,
+          to: convId,
           raw: delivered,
         });
 
-        results.push({ to: `+${usedTo}`, ok: true, id: wamid });
+        results.push({ to: convId, ok: true, id: wamid });
       } else {
         results.push({ to: raw, ok: false, error: lastErr || { message: "send_failed" } });
       }
     }
 
-    // HTTP 207 semántico (pero devolvemos 200 con detalle)
     return res.status(200).json({ ok: results.every(r => r.ok), results });
   } catch (err) {
     console.error("sendMessage error:", err);
