@@ -5,6 +5,7 @@ const GRAPH_BASE = "https://graph.facebook.com/v23.0";
 const PHONE_ID = process.env.META_WA_PHONE_ID;
 const TOKEN    = process.env.META_WA_TOKEN;
 
+
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
