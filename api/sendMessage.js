@@ -11,28 +11,56 @@ function cors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
+// --- Helpers comunes ---
 const digits = (s) => String(s || "").replace(/\D/g, "");
 
-// Genera 549... y 54..15... para AR
+// Igual que en el webhook: canónica AR = +549AAAXXXXXXX
+function normalizeE164AR(waIdOrPhone) {
+  const d = digits(waIdOrPhone);
+
+  // ya canónico
+  if (d.startsWith("549")) return `+${d}`;
+
+  // 54 + area(2-4) + 15 + local  ->  +549 + area + local
+  const m = d.match(/^54(\d{2,4})15(\d+)$/);
+  if (m) {
+    const [, area, local] = m;
+    return `+549${area}${local}`;
+  }
+
+  // por si viene +54… sin 15
+  if (d.startsWith("54")) return `+${d}`;
+
+  // otros países: sólo agrego +
+  return `+${d}`;
+}
+
+// Genera candidatos para AR y prioriza SIEMPRE 549... primero
 function candidatesAR(toRaw) {
   const d0 = digits(toRaw);
 
+  // Si ya empieza con 54..., reordenamos para que 549 vaya primero
   if (d0.startsWith("54")) {
-    const out = [d0];
-    if (/^549(\d{3})(\d+)$/.test(d0)) {
-      const [, area, rest] = d0.match(/^549(\d{3})(\d+)$/);
-      out.push(`54${area}15${rest}`);
-    } else if (/^54(\d{3})15(\d+)$/.test(d0)) {
-      const [, area, rest] = d0.match(/^54(\d{3})15(\d+)$/);
-      out.push(`549${area}${rest}`);
+    const m15 = d0.match(/^54(\d{2,4})15(\d+)$/);
+    const m49 = d0.match(/^549(\d{2,4})(\d+)$/);
+    if (m15) {
+      const [, area, rest] = m15;
+      return [`549${area}${rest}`, `54${area}15${rest}`];
     }
-    return Array.from(new Set(out));
+    if (m49) {
+      const [, area, rest] = m49;
+      return [`549${area}${rest}`, `54${area}15${rest}`];
+    }
+    // Otro caso raro: lo dejamos tal cual
+    return [d0];
   }
 
+  // Entrada sin 54/549 (ej "3518120950" o "0351...")
   let d = d0;
   if (d.startsWith("00")) d = d.slice(2);
   if (d.startsWith("0"))  d = d.slice(1);
 
+  // área 2 dígitos para CABA (11), 3 para el resto (simplificado)
   let areaLen = 3;
   if (/^11\d{8}$/.test(d)) areaLen = 2;
   const area  = d.slice(0, areaLen);
@@ -81,6 +109,7 @@ export default async function handler(req, res) {
 
       let delivered = null, usedTo = null, lastErr = null;
 
+      // Intentamos en orden, pero sólo registramos usando el ID CANÓNICO
       for (const cand of cands) {
         const payload = template
           ? { type: "template", template }
@@ -93,11 +122,11 @@ export default async function handler(req, res) {
 
         const code = r?.json?.error?.code;
         lastErr = r.json;
-        if (code !== 131030) break; // si no es “formato no permitido”, no insistas
+        if (code !== 131030) break; // si no es “formato no permitido”, no sigas
       }
 
-      // Conversación y mensaje (evitando undefined)
-      const convId  = `+${usedTo || cands[0]}`;
+      // 🔒 Conversación SIEMPRE bajo convId canónico (igual que el webhook)
+      const convId  = normalizeE164AR(usedTo || cands[0]); // ej. "+5493518120950"
       const convRef = db.collection("conversations").doc(convId);
 
       await convRef.set(
@@ -111,24 +140,21 @@ export default async function handler(req, res) {
         direction: "out",
         type: template ? "template" : "text",
         timestamp: FieldValue.serverTimestamp(),
-        to: convId,
+        to: convId,                    // ✅ almacenado canónico
+        toRaw: usedTo || cands[0],     // opcional: para depurar lo enviado a Graph
         status: delivered ? "sent" : "error",
         raw: delivered || undefined,
         error: delivered ? undefined : (lastErr || { message: "send_failed" }),
       };
 
-      // Solo agrego campos cuando existen
-      if (!template) {
-        msgDoc.text = typeof text === "string" ? text : text?.body || "";
-      } else {
-        msgDoc.template = template?.name || null; // null es válido; undefined no
-      }
+      if (!template) msgDoc.text = typeof text === "string" ? text : text?.body || "";
+      else           msgDoc.template = template?.name || null;
 
-      // Eliminar cualquier undefined por las dudas
       Object.keys(msgDoc).forEach((k) => msgDoc[k] === undefined && delete msgDoc[k]);
 
       await convRef.collection("messages").doc(wamid).set(msgDoc, { merge: true });
 
+      // Le devolvemos al front el ID correcto del hilo para que navegue ahí
       results.push({ to: convId, ok: !!delivered, id: wamid, error: msgDoc.error });
     }
 
