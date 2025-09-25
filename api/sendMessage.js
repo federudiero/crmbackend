@@ -1,18 +1,20 @@
-// api/sendMessage.js — respeta emisor elegido y cae al último que recibió el chat
-import { db, FieldValue } from "../lib/firebaseAdmin.js";
+// backend/api/sendMessage.js
 
+// ====== CORS ======
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*", // poné tu dominio en prod
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+const setCors = (res) => {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+};
+
+// ====== Constantes de Graph / env (leer env acá no rompe OPTIONS) ======
 const GRAPH_BASE = "https://graph.facebook.com/v23.0";
 const DEFAULT_PHONE_ID = process.env.META_WA_PHONE_ID || "";
 const TOKEN = process.env.META_WA_TOKEN || "";
 const PREFER_5415 = String(process.env.META_WA_PREFER_5415 || "") === "1";
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-// ---------- headers ----------
-function cors(res) {
-  res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-}
 
 // ---------- helpers de números (AR) ----------
 const digits = (s) => String(s || "").replace(/\D+/g, "");
@@ -69,27 +71,35 @@ async function sendToGraph(phoneId, toDigits, payload) {
 }
 
 // ---------- resolver emisor ----------
-async function resolvePhoneIdFor(toRaw, explicitPhoneId, defaultPhoneId) {
-  if (explicitPhoneId) return explicitPhoneId; // front manda fromWaPhoneId
+async function resolvePhoneIdFor(db, toRaw, explicitPhoneId, defaultPhoneId) {
+  if (explicitPhoneId) return explicitPhoneId; // front manda fromWaPhoneId/phoneId
   const convId = normalizeE164AR(toRaw);
   if (convId) {
     try {
       const snap = await db.collection("conversations").doc(convId).get();
       const fromConv = snap.exists ? snap.data()?.lastInboundPhoneId : null;
-      if (fromConv) return fromConv; // mismo número que recibió
+      if (fromConv) return fromConv; // usar el mismo número que recibió
     } catch { /* ignore */ }
   }
   return defaultPhoneId;
 }
 
-// ---------- handler ----------
+// ====== HANDLER ======
 export default async function handler(req, res) {
-  cors(res);
+  setCors(res);
+
+  // Preflight siempre 204, sin inicializar nada
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST")   return res.status(405).json({ error: "method_not_allowed" });
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "method_not_allowed" });
+  }
 
   try {
     if (!TOKEN) return res.status(500).json({ error: "server_misconfigured" });
+
+    // ⚠️ Import dinámico para que si firebaseAdmin.js rompe, no rompa el OPTIONS
+    const { db, FieldValue } = await import("../lib/firebaseAdmin.js");
 
     const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
     let { to, text, template, image, audio, fromWaPhoneId, phoneId } = body;
@@ -103,7 +113,7 @@ export default async function handler(req, res) {
     const results = [];
 
     for (const raw of recipients) {
-      const PHONE_ID = await resolvePhoneIdFor(raw, (fromWaPhoneId || phoneId), DEFAULT_PHONE_ID);
+      const PHONE_ID = await resolvePhoneIdFor(db, raw, (fromWaPhoneId || phoneId), DEFAULT_PHONE_ID);
       if (!PHONE_ID) return res.status(500).json({ error: "no_phone_id_available" });
 
       const cands = candidatesForSendAR(raw);
@@ -112,30 +122,26 @@ export default async function handler(req, res) {
       for (const cand of cands) {
         // --- Selección de payload (media > template > text) ---
         let payload;
-        let outType = "text";
         if (image) {
           payload = { type: "image", image };
-          outType = "image";
         } else if (audio) {
           payload = { type: "audio", audio };
-          outType = "audio";
         } else if (template) {
           payload = { type: "template", template };
-          outType = "template";
         } else {
           payload = { type: "text", text: { body: typeof text === "string" ? text : (text?.body || ""), preview_url: false } };
-          outType = "text";
         }
 
         const r = await sendToGraph(PHONE_ID, cand, payload);
         if (r.ok) {
-          delivered = r.json; usedToDigits = cand; usedVariant = cand.startsWith("549") ? "549" : "5415";
-          // Persistimos abajo (usando outType)
-          // Nota: si querés cortar rápido al primer éxito, break está bien.
-          break;
+          delivered = r.json;
+          usedToDigits = cand;
+          usedVariant = cand.startsWith("549") ? "549" : "5415";
+          break; // al primer éxito, salimos
         }
         lastErr = r.json;
-        if (r?.json?.error?.code !== 131030) break; // si no es sandbox allow-list, no insistir
+        // si no es sandbox allow-list, no insistir
+        if (r?.json?.error?.code !== 131030) break;
       }
 
       const convId = normalizeE164AR(usedToDigits || cands[0]);
@@ -147,7 +153,7 @@ export default async function handler(req, res) {
 
       const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
 
-      // Reconstruimos qué tipo mandamos realmente
+      // tipo realmente enviado
       const sentType = image ? "image" : audio ? "audio" : (template ? "template" : "text");
 
       const msgDoc = {
@@ -188,12 +194,21 @@ export default async function handler(req, res) {
       Object.keys(msgDoc).forEach((k) => msgDoc[k] === undefined && delete msgDoc[k]);
       await convRef.collection("messages").doc(wamid).set(msgDoc, { merge: true });
 
-      results.push({ to: convId, ok: !!delivered, id: wamid, phoneId: PHONE_ID, sendVariant: msgDoc.sendVariant, error: msgDoc.error });
+      results.push({
+        to: convId,
+        ok: !!delivered,
+        id: wamid,
+        phoneId: PHONE_ID,
+        sendVariant: msgDoc.sendVariant,
+        error: msgDoc.error,
+      });
     }
 
     return res.status(200).json({ ok: results.every(r => r.ok), results });
   } catch (err) {
+    // siempre devolver CORS también en error
+    setCors(res);
     console.error("sendMessage error:", err);
-    return res.status(500).json({ error: "internal_error" });
+    return res.status(500).json({ error: err.message || "internal_error" });
   }
 }
