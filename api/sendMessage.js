@@ -92,10 +92,12 @@ export default async function handler(req, res) {
     if (!TOKEN) return res.status(500).json({ error: "server_misconfigured" });
 
     const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
-    let { to, text, template, fromWaPhoneId, phoneId } = body;
+    let { to, text, template, image, audio, fromWaPhoneId, phoneId } = body;
 
     if (!to) return res.status(400).json({ error: "missing_to" });
-    if (!text && !template) return res.status(400).json({ error: "missing_text_or_template" });
+    if (!text && !template && !image && !audio) {
+      return res.status(400).json({ error: "missing_text_or_template_or_media" });
+    }
 
     const recipients = Array.isArray(to) ? to : [to];
     const results = [];
@@ -108,12 +110,30 @@ export default async function handler(req, res) {
       let delivered = null, usedToDigits = null, usedVariant = null, lastErr = null;
 
       for (const cand of cands) {
-        const payload = template
-          ? { type: "template", template }
-          : { type: "text", text: { body: typeof text === "string" ? text : (text?.body || ""), preview_url: false } };
+        // --- Selección de payload (media > template > text) ---
+        let payload;
+        let outType = "text";
+        if (image) {
+          payload = { type: "image", image };
+          outType = "image";
+        } else if (audio) {
+          payload = { type: "audio", audio };
+          outType = "audio";
+        } else if (template) {
+          payload = { type: "template", template };
+          outType = "template";
+        } else {
+          payload = { type: "text", text: { body: typeof text === "string" ? text : (text?.body || ""), preview_url: false } };
+          outType = "text";
+        }
 
         const r = await sendToGraph(PHONE_ID, cand, payload);
-        if (r.ok) { delivered = r.json; usedToDigits = cand; usedVariant = cand.startsWith("549") ? "549" : "5415"; break; }
+        if (r.ok) {
+          delivered = r.json; usedToDigits = cand; usedVariant = cand.startsWith("549") ? "549" : "5415";
+          // Persistimos abajo (usando outType)
+          // Nota: si querés cortar rápido al primer éxito, break está bien.
+          break;
+        }
         lastErr = r.json;
         if (r?.json?.error?.code !== 131030) break; // si no es sandbox allow-list, no insistir
       }
@@ -126,9 +146,13 @@ export default async function handler(req, res) {
       );
 
       const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
+
+      // Reconstruimos qué tipo mandamos realmente
+      const sentType = image ? "image" : audio ? "audio" : (template ? "template" : "text");
+
       const msgDoc = {
         direction: "out",
-        type: template ? "template" : "text",
+        type: sentType,
         timestamp: FieldValue.serverTimestamp(),
         to: convId,
         toRawSent: usedToDigits ? `+${usedToDigits}` : undefined,
@@ -138,8 +162,28 @@ export default async function handler(req, res) {
         raw: delivered || undefined,
         error: delivered ? undefined : (lastErr || { message: "send_failed" }),
       };
-      if (!template) msgDoc.text = typeof text === "string" ? text : (text?.body || "");
-      else msgDoc.template = template?.name || null;
+
+      if (sentType === "text") {
+        msgDoc.text = typeof text === "string" ? text : (text?.body || "");
+      }
+      if (sentType === "template") {
+        msgDoc.template = template?.name || null;
+      }
+      if (sentType === "image") {
+        msgDoc.media = {
+          kind: "image",
+          ...(image?.link ? { link: image.link } : {}),
+          ...(image?.id ? { id: image.id } : {}),
+          ...(image?.caption ? { caption: image.caption } : {}),
+        };
+      }
+      if (sentType === "audio") {
+        msgDoc.media = {
+          kind: "audio",
+          ...(audio?.link ? { link: audio.link } : {}),
+          ...(audio?.id ? { id: audio.id } : {}),
+        };
+      }
 
       Object.keys(msgDoc).forEach((k) => msgDoc[k] === undefined && delete msgDoc[k]);
       await convRef.collection("messages").doc(wamid).set(msgDoc, { merge: true });

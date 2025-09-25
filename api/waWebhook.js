@@ -1,5 +1,5 @@
-// api/waWebhook.js — bandeja global sin auto-asignación
-import { db, FieldValue } from "../lib/firebaseAdmin.js";
+// api/waWebhook.js — bandeja global con soporte de imágenes y audios
+import { db, FieldValue, bucket } from "../lib/firebaseAdmin.js";
 
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -31,6 +31,39 @@ function extractTextFromMessage(m) {
     m.document?.caption ||
     ""
   );
+}
+
+// === Helpers para media ===
+const GRAPH = "https://graph.facebook.com/v23.0";
+const WA_TOKEN = process.env.META_WA_TOKEN;
+
+/** Descarga metadata + binario del media de WhatsApp */
+async function fetchMedia(mediaId) {
+  const metaRes = await fetch(`${GRAPH}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+  });
+  const meta = await metaRes.json(); // { url, mime_type, ... }
+  if (!meta?.url) return null;
+
+  const binRes = await fetch(meta.url, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+  });
+  const arrayBuf = await binRes.arrayBuffer();
+  const buf = Buffer.from(arrayBuf);
+
+  const mime = meta.mime_type || "application/octet-stream";
+  return { buf, mime };
+}
+
+/** Guarda el binario en Storage y devuelve URL firmada larga */
+async function saveToStorageAndSign(convId, waMessageId, mime, buf) {
+  const ext = (mime.split("/")[1] || "bin").split(";")[0];
+  const path = `conversations/${convId}/${waMessageId}.${ext}`;
+  await bucket.file(path).save(buf, { contentType: mime });
+  const [url] = await bucket
+    .file(path)
+    .getSignedUrl({ action: "read", expires: "3025-01-01" }); // URL pública larga
+  return { path, url };
 }
 
 export default async function handler(req, res) {
@@ -90,19 +123,50 @@ export default async function handler(req, res) {
       if (!convSnap.exists) baseConv.createdAt = FieldValue.serverTimestamp();
       await convRef.set(baseConv, { merge: true });
 
-      // message
-      await convRef.collection("messages").doc(waMessageId).set(
-        {
-          direction: "in",
-          type: m.type || "text",
-          text,
-          timestamp: new Date(tsSec * 1000),
-          businessPhoneId: phoneId || null,
-          businessDisplay: phoneDisplay || null,
-          raw: m,
-        },
-        { merge: true }
-      );
+      // --- Datos base del mensaje (se usan para texto, imagen o audio) ---
+      const messageData = {
+        direction: "in",
+        type: m.type || "text",
+        text,
+        timestamp: new Date(tsSec * 1000),
+        businessPhoneId: phoneId || null,
+        businessDisplay: phoneDisplay || null,
+        raw: m,
+      };
+
+      // === IMAGEN ===
+      if (m.type === "image" && m.image?.id) {
+        const file = await fetchMedia(m.image.id);
+        if (file) {
+          const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+          messageData.media = {
+            kind: "image",
+            path: saved.path,
+            url: saved.url,
+            mime: file.mime,
+            size: file.buf.length,
+          };
+        }
+      }
+
+      // === AUDIO / VOICE NOTE ===
+      if (m.type === "audio" && m.audio?.id) {
+        const file = await fetchMedia(m.audio.id);
+        if (file) {
+          const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+          messageData.media = {
+            kind: "audio",
+            voice: Boolean(m.audio?.voice),
+            path: saved.path,
+            url: saved.url,
+            mime: file.mime, // suele ser audio/ogg;codecs=opus en notas de voz
+            size: file.buf.length,
+          };
+        }
+      }
+
+      // Escribimos el mensaje (si no hubo media, igual se guarda el texto)
+      await convRef.collection("messages").doc(waMessageId).set(messageData, { merge: true });
     }
 
     // ====== ESTADOS ======
