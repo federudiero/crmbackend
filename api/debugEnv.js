@@ -1,4 +1,4 @@
-// api/debugEnv.js
+// api/debugEnv.js - Updated for Firebase debug
 export default function handler(req, res) {
   const envStatus = {
     // WhatsApp variables
