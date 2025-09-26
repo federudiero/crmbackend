@@ -84,6 +84,18 @@ async function resolvePhoneIdFor(db, toRaw, explicitPhoneId, defaultPhoneId) {
   return defaultPhoneId;
 }
 
+// ---------- generar preview de mensaje saliente ----------
+function generateOutboundMessagePreview(text, image, audio, template) {
+  if (image) return "📷 Imagen";
+  if (audio) return "🎵 Audio";
+  if (template) return `📋 ${template.name || "Plantilla"}`;
+  if (text) {
+    const textContent = typeof text === "string" ? text : (text?.body || "");
+    return textContent.length > 50 ? textContent.substring(0, 50) + "..." : textContent;
+  }
+  return "💬 Mensaje";
+}
+
 // ====== HANDLER ======
 export default async function handler(req, res) {
   setCors(res);
@@ -146,8 +158,13 @@ export default async function handler(req, res) {
 
       const convId = normalizeE164AR(usedToDigits || cands[0]);
       const convRef = db.collection("conversations").doc(convId);
+      const messagePreview = generateOutboundMessagePreview(text, image, audio, template);
       await convRef.set(
-        { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
+        { 
+          contactId: convId, 
+          lastMessageAt: FieldValue.serverTimestamp(),
+          lastMessageText: messagePreview
+        },
         { merge: true }
       );
 

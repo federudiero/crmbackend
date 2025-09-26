@@ -33,6 +33,25 @@ function extractTextFromMessage(m) {
   );
 }
 
+function generateMessagePreview(m) {
+  if (m.type === "text") {
+    const text = m.text?.body || "";
+    return text.length > 50 ? text.substring(0, 50) + "..." : text;
+  }
+  if (m.type === "image") return "📷 Imagen";
+  if (m.type === "audio") return "🎵 Audio";
+  if (m.type === "video") return "🎥 Video";
+  if (m.type === "document") return "📄 Documento";
+  if (m.type === "sticker") return "🎭 Sticker";
+  if (m.type === "location") return "📍 Ubicación";
+  if (m.type === "contacts") return "👤 Contacto";
+  if (m.type === "interactive") {
+    if (m.interactive?.type === "button_reply") return m.interactive.button_reply?.title || "🔘 Botón";
+    if (m.interactive?.type === "list_reply") return m.interactive.list_reply?.title || "📋 Lista";
+  }
+  return "💬 Mensaje";
+}
+
 // === Helpers para media ===
 const GRAPH = "https://graph.facebook.com/v23.0";
 const WA_TOKEN = process.env.META_WA_TOKEN;
@@ -114,9 +133,11 @@ export default async function handler(req, res) {
       // conversations (⚠️ sin owner/asignación: bandeja global)
       const convRef = db.collection("conversations").doc(convId);
       const convSnap = await convRef.get();
+      const messagePreview = generateMessagePreview(m);
       const baseConv = {
         contactId: convId,
         lastMessageAt: FieldValue.serverTimestamp(),
+        lastMessageText: messagePreview,
         lastInboundPhoneId: phoneId || null,
         lastInboundDisplay: phoneDisplay || null,
       };
