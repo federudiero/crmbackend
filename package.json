@@ -1,0 +1,9 @@
+{
+  "name": "crm-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "firebase-admin": "^12.7.0"
+  }
+}
