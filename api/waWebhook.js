@@ -84,6 +84,8 @@ export default async function handler(req, res) {
 
   try {
     const body = safeParseBody(req);
+    console.log("📥 Webhook recibido:", JSON.stringify(body, null, 2));
+    
     const entry = body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value  = change?.value;
@@ -95,6 +97,13 @@ export default async function handler(req, res) {
 
     // ====== MENSAJES ENTRANTES ======
     for (const m of (value.messages || [])) {
+      console.log("📨 Procesando mensaje:", {
+        type: m.type,
+        from: m.from,
+        hasImage: !!m.image?.id,
+        hasAudio: !!m.audio?.id
+      });
+      
       const convId = normalizeE164AR(m.from);
       const waMessageId = m.id;
       const tsSec = Number(m.timestamp || Math.floor(Date.now() / 1000));
@@ -136,37 +145,61 @@ export default async function handler(req, res) {
 
       // === IMAGEN ===
       if (m.type === "image" && m.image?.id) {
-        const file = await fetchMedia(m.image.id);
-        if (file) {
-          const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-          messageData.media = {
-            kind: "image",
-            path: saved.path,
-            url: saved.url,
-            mime: file.mime,
-            size: file.buf.length,
-          };
+        console.log("🖼️ Procesando imagen con ID:", m.image.id);
+        try {
+          const file = await fetchMedia(m.image.id);
+          if (file) {
+            console.log("✅ Imagen descargada, tamaño:", file.buf.length, "bytes");
+            const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            console.log("✅ Imagen guardada en:", saved.path);
+            messageData.media = {
+              kind: "image",
+              path: saved.path,
+              url: saved.url,
+              mime: file.mime,
+              size: file.buf.length,
+            };
+          } else {
+            console.error("❌ No se pudo descargar la imagen");
+          }
+        } catch (error) {
+          console.error("❌ Error procesando imagen:", error);
         }
       }
 
       // === AUDIO / VOICE NOTE ===
       if (m.type === "audio" && m.audio?.id) {
-        const file = await fetchMedia(m.audio.id);
-        if (file) {
-          const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-          messageData.media = {
-            kind: "audio",
-            voice: Boolean(m.audio?.voice),
-            path: saved.path,
-            url: saved.url,
-            mime: file.mime, // suele ser audio/ogg;codecs=opus en notas de voz
-            size: file.buf.length,
-          };
+        console.log("🎵 Procesando audio con ID:", m.audio.id);
+        try {
+          const file = await fetchMedia(m.audio.id);
+          if (file) {
+            console.log("✅ Audio descargado, tamaño:", file.buf.length, "bytes");
+            const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            console.log("✅ Audio guardado en:", saved.path);
+            messageData.media = {
+              kind: "audio",
+              voice: Boolean(m.audio?.voice),
+              path: saved.path,
+              url: saved.url,
+              mime: file.mime, // suele ser audio/ogg;codecs=opus en notas de voz
+              size: file.buf.length,
+            };
+          } else {
+            console.error("❌ No se pudo descargar el audio");
+          }
+        } catch (error) {
+          console.error("❌ Error procesando audio:", error);
         }
       }
 
       // Escribimos el mensaje (si no hubo media, igual se guarda el texto)
+      console.log("💾 Guardando mensaje en Firestore:", {
+        convId,
+        waMessageId,
+        hasMedia: !!messageData.media
+      });
       await convRef.collection("messages").doc(waMessageId).set(messageData, { merge: true });
+      console.log("✅ Mensaje guardado exitosamente");
     }
 
     // ====== ESTADOS ======
