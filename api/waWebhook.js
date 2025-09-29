@@ -37,23 +37,39 @@ function extractTextFromMessage(m) {
 const GRAPH = "https://graph.facebook.com/v23.0";
 const WA_TOKEN = process.env.META_WA_TOKEN;
 
-/** Descarga metadata + binario del media de WhatsApp */
-async function fetchMedia(mediaId) {
-  console.log(`🔍 [fetchMedia] Iniciando descarga para mediaId: ${mediaId}`);
+/** Descarga metadata + binario del media de WhatsApp con reintentos inmediatos */
+async function fetchMedia(mediaId, retryCount = 0) {
+  const MAX_RETRIES = 2;
+  const TIMEOUT_MS = 5000; // 5 segundos timeout agresivo
+  
+  console.log(`🔍 [fetchMedia] Iniciando descarga para mediaId: ${mediaId} (intento ${retryCount + 1}/${MAX_RETRIES + 1})`);
   
   try {
-    // Paso 1: Obtener metadata
+    // Paso 1: Obtener metadata con timeout
     console.log(`📡 [fetchMedia] Solicitando metadata de ${GRAPH}/${mediaId}`);
+    
+    const metaController = new AbortController();
+    const metaTimeout = setTimeout(() => metaController.abort(), TIMEOUT_MS);
+    
     const metaRes = await fetch(`${GRAPH}/${mediaId}`, {
       headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      signal: metaController.signal
     });
     
+    clearTimeout(metaTimeout);
     console.log(`📊 [fetchMedia] Respuesta metadata - Status: ${metaRes.status}, OK: ${metaRes.ok}`);
     
     if (!metaRes.ok) {
-      console.error(`❌ [fetchMedia] Error en metadata - Status: ${metaRes.status}`);
       const errorText = await metaRes.text();
-      console.error(`❌ [fetchMedia] Error details: ${errorText}`);
+      console.error(`❌ [fetchMedia] Error en metadata - Status: ${metaRes.status}, Details: ${errorText}`);
+      
+      // Si es error 400 (objeto no existe/expirado) y tenemos reintentos, intentar inmediatamente
+      if (metaRes.status === 400 && retryCount < MAX_RETRIES) {
+        console.log(`🔄 [fetchMedia] Media expirado, reintentando inmediatamente...`);
+        await new Promise(resolve => setTimeout(resolve, 100)); // Pausa mínima de 100ms
+        return fetchMedia(mediaId, retryCount + 1);
+      }
+      
       return null;
     }
     
@@ -65,18 +81,31 @@ async function fetchMedia(mediaId) {
       return null;
     }
 
-    // Paso 2: Descargar binario
-    console.log(`📥 [fetchMedia] Descargando binario desde: ${meta.url}`);
+    // Paso 2: Descargar binario inmediatamente con timeout
+    console.log(`📥 [fetchMedia] Descargando binario INMEDIATAMENTE desde: ${meta.url}`);
+    
+    const binController = new AbortController();
+    const binTimeout = setTimeout(() => binController.abort(), TIMEOUT_MS);
+    
     const binRes = await fetch(meta.url, {
       headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      signal: binController.signal
     });
     
+    clearTimeout(binTimeout);
     console.log(`📊 [fetchMedia] Respuesta binario - Status: ${binRes.status}, OK: ${binRes.ok}`);
     
     if (!binRes.ok) {
-      console.error(`❌ [fetchMedia] Error descargando binario - Status: ${binRes.status}`);
       const errorText = await binRes.text();
-      console.error(`❌ [fetchMedia] Binary error details: ${errorText}`);
+      console.error(`❌ [fetchMedia] Error descargando binario - Status: ${binRes.status}, Details: ${errorText}`);
+      
+      // Si falla la descarga del binario y tenemos reintentos, intentar de nuevo
+      if (retryCount < MAX_RETRIES) {
+        console.log(`🔄 [fetchMedia] Error en descarga binaria, reintentando...`);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        return fetchMedia(mediaId, retryCount + 1);
+      }
+      
       return null;
     }
     
@@ -84,11 +113,19 @@ async function fetchMedia(mediaId) {
     const buf = Buffer.from(arrayBuf);
     const mime = meta.mime_type || "application/octet-stream";
     
-    console.log(`✅ [fetchMedia] Descarga exitosa - Size: ${buf.length} bytes, MIME: ${mime}`);
+    console.log(`✅ [fetchMedia] Descarga exitosa - Size: ${buf.length} bytes, MIME: ${mime}, Intentos: ${retryCount + 1}`);
     return { buf, mime };
     
   } catch (error) {
-    console.error(`💥 [fetchMedia] Error inesperado:`, error);
+    console.error(`💥 [fetchMedia] Error inesperado (intento ${retryCount + 1}):`, error.message);
+    
+    // Si es timeout o error de red y tenemos reintentos, intentar de nuevo
+    if (retryCount < MAX_RETRIES && (error.name === 'AbortError' || error.code === 'ECONNRESET')) {
+      console.log(`🔄 [fetchMedia] Timeout/Error de red, reintentando...`);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      return fetchMedia(mediaId, retryCount + 1);
+    }
+    
     console.error(`💥 [fetchMedia] Stack trace:`, error.stack);
     return null;
   }
@@ -172,28 +209,35 @@ export default async function handler(req, res) {
         raw: m,
       };
 
-      // === IMAGEN (con fallbacks) ===
+      // === IMAGEN (con descarga INMEDIATA y priorizada) ===
       if (m.type === "image") {
         const imgId = m.image?.id || null;
         const imgLink = m.image?.link || null; // Meta a veces envía link temporal
 
-        console.log("🖼️ DEBUG Webhook Image:", {
-          waMessageId, convId, hasId: !!imgId, hasLink: !!imgLink
+        console.log("🖼️ DEBUG Webhook Image - PROCESAMIENTO INMEDIATO:", {
+          waMessageId, convId, hasId: !!imgId, hasLink: !!imgLink, timestamp: new Date().toISOString()
         });
 
         let saved = null;
+        
+        // PRIORIDAD 1: Descarga inmediata si tenemos media_id
         if (imgId) {
+          console.log("🚀 [IMAGE] Iniciando descarga INMEDIATA para evitar expiración");
           try {
             const file = await fetchMedia(imgId);
             console.log("🖼️ DEBUG Fetched image:", {
-              ok: !!file, mime: file?.mime, size: file?.buf?.length
+              ok: !!file, mime: file?.mime, size: file?.buf?.length, timestamp: new Date().toISOString()
             });
+            
             if (file) {
+              // Subir inmediatamente a Firebase Storage
+              console.log("☁️ [IMAGE] Subiendo inmediatamente a Firebase Storage");
               saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-              console.log("🖼️ DEBUG Saved image:", saved);
+              console.log("🖼️ DEBUG Saved image:", { ...saved, timestamp: new Date().toISOString() });
             }
           } catch (error) {
             console.error("🖼️ ERROR downloading/saving image:", error);
+            console.error("🖼️ ERROR timestamp:", new Date().toISOString());
             // Si falla la descarga, intentamos usar el link directo si existe
             if (imgLink) {
               console.log("🖼️ FALLBACK: Using direct link from webhook");
@@ -201,7 +245,7 @@ export default async function handler(req, res) {
           }
         }
 
-        // Fallbacks: si no se pudo guardar, usamos el link que venga del webhook
+        // Configurar datos del mensaje según resultado de descarga
         if (saved?.url || imgLink) {
           messageData.media = {
             kind: "image",
@@ -210,12 +254,19 @@ export default async function handler(req, res) {
             mime: saved ? undefined : (m.image?.mime_type || undefined),
           };
           messageData.mediaUrl = saved?.url || imgLink; // AGREGADO: URL directa para compatibilidad
+          console.log("✅ [IMAGE] Imagen procesada exitosamente:", { 
+            hasStorageUrl: !!saved?.url, 
+            hasFallbackLink: !!imgLink,
+            finalUrl: saved?.url || imgLink
+          });
         } else {
           // Último recurso: marcamos que hubo imagen aunque no tengamos URL
-          console.warn("🖼️ WARNING: Image message without valid URL", { waMessageId, imgId: !!imgId, imgLink: !!imgLink });
+          console.warn("🖼️ WARNING: Image message without valid URL", { 
+            waMessageId, imgId: !!imgId, imgLink: !!imgLink, timestamp: new Date().toISOString()
+          });
           messageData.media = { kind: "image" };
           messageData.hasMedia = true; // Marcamos que tenía media pero no pudimos obtener URL
-          messageData.mediaError = "URL_NOT_AVAILABLE"; // Flag para el frontend
+          messageData.mediaError = "DOWNLOAD_FAILED_EXPIRED"; // Flag específico para expiración
         }
       }
 
