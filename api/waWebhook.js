@@ -1,4 +1,4 @@
-// api/waWebhook.js — bandeja global con soporte de imágenes y audios
+// api/waWebhook.js — bandeja global con soporte de imágenes, audios y stickers
 import { db, FieldValue, bucket } from "../lib/firebaseAdmin.js";
 
 function cors(res) {
@@ -42,7 +42,7 @@ async function fetchMedia(mediaId) {
   const metaRes = await fetch(`${GRAPH}/${mediaId}`, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
-  const meta = await metaRes.json(); // { url, mime_type, ... }
+  const meta = await metaRes.json();
   if (!meta?.url) return null;
 
   const binRes = await fetch(meta.url, {
@@ -58,11 +58,11 @@ async function fetchMedia(mediaId) {
 /** Guarda el binario en Storage y devuelve URL firmada larga */
 async function saveToStorageAndSign(convId, waMessageId, mime, buf) {
   const ext = (mime.split("/")[1] || "bin").split(";")[0];
-  const path = `conversations/${convId}/${waMessageId}.${ext}`;
+  const path = `public/conversations/${convId}/${waMessageId}.${ext}`;
   await bucket.file(path).save(buf, { contentType: mime });
   const [url] = await bucket
     .file(path)
-    .getSignedUrl({ action: "read", expires: "3025-01-01" }); // URL pública larga
+    .getSignedUrl({ action: "read", expires: "3025-01-01" });
   return { path, url };
 }
 
@@ -84,8 +84,6 @@ export default async function handler(req, res) {
 
   try {
     const body = safeParseBody(req);
-    console.log("📥 Webhook recibido:", JSON.stringify(body, null, 2));
-    
     const entry = body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value  = change?.value;
@@ -97,13 +95,6 @@ export default async function handler(req, res) {
 
     // ====== MENSAJES ENTRANTES ======
     for (const m of (value.messages || [])) {
-      console.log("📨 Procesando mensaje:", {
-        type: m.type,
-        from: m.from,
-        hasImage: !!m.image?.id,
-        hasAudio: !!m.audio?.id
-      });
-      
       const convId = normalizeE164AR(m.from);
       const waMessageId = m.id;
       const tsSec = Number(m.timestamp || Math.floor(Date.now() / 1000));
@@ -120,7 +111,7 @@ export default async function handler(req, res) {
       if (!contactSnap.exists) contactData.createdAt = FieldValue.serverTimestamp();
       await contactRef.set(contactData, { merge: true });
 
-      // conversations (⚠️ sin owner/asignación: bandeja global)
+      // conversations
       const convRef = db.collection("conversations").doc(convId);
       const convSnap = await convRef.get();
       const baseConv = {
@@ -132,7 +123,6 @@ export default async function handler(req, res) {
       if (!convSnap.exists) baseConv.createdAt = FieldValue.serverTimestamp();
       await convRef.set(baseConv, { merge: true });
 
-      // --- Datos base del mensaje (se usan para texto, imagen o audio) ---
       const messageData = {
         direction: "in",
         type: m.type || "text",
@@ -145,13 +135,10 @@ export default async function handler(req, res) {
 
       // === IMAGEN ===
       if (m.type === "image" && m.image?.id) {
-        console.log("🖼️ Procesando imagen con ID:", m.image.id);
         try {
           const file = await fetchMedia(m.image.id);
           if (file) {
-            console.log("✅ Imagen descargada, tamaño:", file.buf.length, "bytes");
             const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-            console.log("✅ Imagen guardada en:", saved.path);
             messageData.media = {
               kind: "image",
               path: saved.path,
@@ -159,47 +146,52 @@ export default async function handler(req, res) {
               mime: file.mime,
               size: file.buf.length,
             };
-          } else {
-            console.error("❌ No se pudo descargar la imagen");
           }
         } catch (error) {
-          console.error("❌ Error procesando imagen:", error);
+          console.error("image error:", error);
         }
       }
 
       // === AUDIO / VOICE NOTE ===
       if (m.type === "audio" && m.audio?.id) {
-        console.log("🎵 Procesando audio con ID:", m.audio.id);
         try {
           const file = await fetchMedia(m.audio.id);
           if (file) {
-            console.log("✅ Audio descargado, tamaño:", file.buf.length, "bytes");
             const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-            console.log("✅ Audio guardado en:", saved.path);
             messageData.media = {
               kind: "audio",
               voice: Boolean(m.audio?.voice),
               path: saved.path,
               url: saved.url,
-              mime: file.mime, // suele ser audio/ogg;codecs=opus en notas de voz
+              mime: file.mime,
               size: file.buf.length,
             };
-          } else {
-            console.error("❌ No se pudo descargar el audio");
           }
         } catch (error) {
-          console.error("❌ Error procesando audio:", error);
+          console.error("audio error:", error);
         }
       }
 
-      // Escribimos el mensaje (si no hubo media, igual se guarda el texto)
-      console.log("💾 Guardando mensaje en Firestore:", {
-        convId,
-        waMessageId,
-        hasMedia: !!messageData.media
-      });
+      // === STICKER ===
+      if (m.type === "sticker" && m.sticker?.id) {
+        try {
+          const file = await fetchMedia(m.sticker.id);
+          if (file) {
+            const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            messageData.media = {
+              kind: "sticker",
+              path: saved.path,
+              url: saved.url,
+              mime: file.mime,
+              size: file.buf.length,
+            };
+          }
+        } catch (error) {
+          console.error("sticker error:", error);
+        }
+      }
+
       await convRef.collection("messages").doc(waMessageId).set(messageData, { merge: true });
-      console.log("✅ Mensaje guardado exitosamente");
     }
 
     // ====== ESTADOS ======
@@ -219,7 +211,6 @@ export default async function handler(req, res) {
     return res.status(200).send("EVENT_RECEIVED");
   } catch (e) {
     console.error("waWebhook error:", e);
-    // WhatsApp reintenta si no devolvés 200 — respondemos 200 para cortar reintentos.
     return res.status(200).send("EVENT_RECEIVED");
   }
 }
