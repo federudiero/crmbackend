@@ -135,10 +135,21 @@ export default async function handler(req, res) {
 
       // === IMAGEN ===
       if (m.type === "image" && m.image?.id) {
+        console.log("🖼️ DEBUG Webhook Image Processing:", {
+          messageId: waMessageId,
+          imageId: m.image.id,
+          convId: convId
+        });
         try {
           const file = await fetchMedia(m.image.id);
+          console.log("🖼️ DEBUG Fetched media file:", {
+            hasFile: !!file,
+            mime: file?.mime,
+            bufferSize: file?.buf?.length
+          });
           if (file) {
             const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            console.log("🖼️ DEBUG Saved to storage:", saved);
             messageData.media = {
               kind: "image",
               path: saved.path,
@@ -146,9 +157,10 @@ export default async function handler(req, res) {
               mime: file.mime,
               size: file.buf.length,
             };
+            console.log("🖼️ DEBUG Final messageData.media:", messageData.media);
           }
         } catch (error) {
-          console.error("image error:", error);
+          console.error("🖼️ ERROR image processing:", error);
         }
       }
 
@@ -192,6 +204,13 @@ export default async function handler(req, res) {
       }
 
       await convRef.collection("messages").doc(waMessageId).set(messageData, { merge: true });
+      console.log("🖼️ DEBUG Message saved to Firestore:", {
+        messageId: waMessageId,
+        type: messageData.type,
+        hasMedia: !!messageData.media,
+        mediaKind: messageData.media?.kind,
+        mediaUrl: messageData.media?.url
+      });
     }
 
     // ====== ESTADOS ======
