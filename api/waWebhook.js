@@ -1,4 +1,4 @@
-// api/waWebhook.js — bandeja global con soporte de imágenes, audios y stickers
+// api/waWebhook.js — bandeja global con soporte de imágenes, audios y stickers (con fallbacks)
 import { db, FieldValue, bucket } from "../lib/firebaseAdmin.js";
 
 function cors(res) {
@@ -39,20 +39,59 @@ const WA_TOKEN = process.env.META_WA_TOKEN;
 
 /** Descarga metadata + binario del media de WhatsApp */
 async function fetchMedia(mediaId) {
-  const metaRes = await fetch(`${GRAPH}/${mediaId}`, {
-    headers: { Authorization: `Bearer ${WA_TOKEN}` },
-  });
-  const meta = await metaRes.json();
-  if (!meta?.url) return null;
+  console.log(`🔍 [fetchMedia] Iniciando descarga para mediaId: ${mediaId}`);
+  
+  try {
+    // Paso 1: Obtener metadata
+    console.log(`📡 [fetchMedia] Solicitando metadata de ${GRAPH}/${mediaId}`);
+    const metaRes = await fetch(`${GRAPH}/${mediaId}`, {
+      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+    });
+    
+    console.log(`📊 [fetchMedia] Respuesta metadata - Status: ${metaRes.status}, OK: ${metaRes.ok}`);
+    
+    if (!metaRes.ok) {
+      console.error(`❌ [fetchMedia] Error en metadata - Status: ${metaRes.status}`);
+      const errorText = await metaRes.text();
+      console.error(`❌ [fetchMedia] Error details: ${errorText}`);
+      return null;
+    }
+    
+    const meta = await metaRes.json();
+    console.log(`📋 [fetchMedia] Metadata recibida:`, JSON.stringify(meta, null, 2));
+    
+    if (!meta?.url) {
+      console.error(`❌ [fetchMedia] No se encontró URL en metadata`);
+      return null;
+    }
 
-  const binRes = await fetch(meta.url, {
-    headers: { Authorization: `Bearer ${WA_TOKEN}` },
-  });
-  const arrayBuf = await binRes.arrayBuffer();
-  const buf = Buffer.from(arrayBuf);
-
-  const mime = meta.mime_type || "application/octet-stream";
-  return { buf, mime };
+    // Paso 2: Descargar binario
+    console.log(`📥 [fetchMedia] Descargando binario desde: ${meta.url}`);
+    const binRes = await fetch(meta.url, {
+      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+    });
+    
+    console.log(`📊 [fetchMedia] Respuesta binario - Status: ${binRes.status}, OK: ${binRes.ok}`);
+    
+    if (!binRes.ok) {
+      console.error(`❌ [fetchMedia] Error descargando binario - Status: ${binRes.status}`);
+      const errorText = await binRes.text();
+      console.error(`❌ [fetchMedia] Binary error details: ${errorText}`);
+      return null;
+    }
+    
+    const arrayBuf = await binRes.arrayBuffer();
+    const buf = Buffer.from(arrayBuf);
+    const mime = meta.mime_type || "application/octet-stream";
+    
+    console.log(`✅ [fetchMedia] Descarga exitosa - Size: ${buf.length} bytes, MIME: ${mime}`);
+    return { buf, mime };
+    
+  } catch (error) {
+    console.error(`💥 [fetchMedia] Error inesperado:`, error);
+    console.error(`💥 [fetchMedia] Stack trace:`, error.stack);
+    return null;
+  }
 }
 
 /** Guarda el binario en Storage y devuelve URL firmada larga */
@@ -133,79 +172,104 @@ export default async function handler(req, res) {
         raw: m,
       };
 
-      // === IMAGEN ===
-      if (m.type === "image" && m.image?.id) {
-        console.log("🖼️ DEBUG Webhook Image Processing:", {
-          messageId: waMessageId,
-          imageId: m.image.id,
-          convId: convId
+      // === IMAGEN (con fallbacks) ===
+      if (m.type === "image") {
+        const imgId = m.image?.id || null;
+        const imgLink = m.image?.link || null; // Meta a veces envía link temporal
+
+        console.log("🖼️ DEBUG Webhook Image:", {
+          waMessageId, convId, hasId: !!imgId, hasLink: !!imgLink
         });
-        try {
-          const file = await fetchMedia(m.image.id);
-          console.log("🖼️ DEBUG Fetched media file:", {
-            hasFile: !!file,
-            mime: file?.mime,
-            bufferSize: file?.buf?.length
-          });
-          if (file) {
-            const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-            console.log("🖼️ DEBUG Saved to storage:", saved);
-            messageData.media = {
-              kind: "image",
-              path: saved.path,
-              url: saved.url,
-              mime: file.mime,
-              size: file.buf.length,
-            };
-            console.log("🖼️ DEBUG Final messageData.media:", messageData.media);
+
+        let saved = null;
+        if (imgId) {
+          try {
+            const file = await fetchMedia(imgId);
+            console.log("🖼️ DEBUG Fetched image:", {
+              ok: !!file, mime: file?.mime, size: file?.buf?.length
+            });
+            if (file) {
+              saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+              console.log("🖼️ DEBUG Saved image:", saved);
+            }
+          } catch (error) {
+            console.error("🖼️ ERROR downloading/saving image:", error);
+            // Si falla la descarga, intentamos usar el link directo si existe
+            if (imgLink) {
+              console.log("🖼️ FALLBACK: Using direct link from webhook");
+            }
           }
-        } catch (error) {
-          console.error("🖼️ ERROR image processing:", error);
+        }
+
+        // Fallbacks: si no se pudo guardar, usamos el link que venga del webhook
+        if (saved?.url || imgLink) {
+          messageData.media = {
+            kind: "image",
+            path: saved?.path || null,
+            url: saved?.url || imgLink || null,
+            mime: saved ? undefined : (m.image?.mime_type || undefined),
+          };
+          messageData.mediaUrl = saved?.url || imgLink; // AGREGADO: URL directa para compatibilidad
+        } else {
+          // Último recurso: marcamos que hubo imagen aunque no tengamos URL
+          console.warn("🖼️ WARNING: Image message without valid URL", { waMessageId, imgId: !!imgId, imgLink: !!imgLink });
+          messageData.media = { kind: "image" };
+          messageData.hasMedia = true; // Marcamos que tenía media pero no pudimos obtener URL
+          messageData.mediaError = "URL_NOT_AVAILABLE"; // Flag para el frontend
         }
       }
 
-      // === AUDIO / VOICE NOTE ===
-      if (m.type === "audio" && m.audio?.id) {
-        try {
-          const file = await fetchMedia(m.audio.id);
-          if (file) {
-            const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-            messageData.media = {
-              kind: "audio",
-              voice: Boolean(m.audio?.voice),
-              path: saved.path,
-              url: saved.url,
-              mime: file.mime,
-              size: file.buf.length,
-            };
+      // === AUDIO / VOICE NOTE (con fallback link) ===
+      if (m.type === "audio") {
+        const audId = m.audio?.id || null;
+        const audLink = m.audio?.link || null;
+        let saved = null;
+        if (audId) {
+          try {
+            const file = await fetchMedia(audId);
+            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+          } catch (error) {
+            console.error("audio error:", error);
           }
-        } catch (error) {
-          console.error("audio error:", error);
+        }
+        if (saved?.url || audLink) {
+          messageData.media = {
+            kind: "audio",
+            voice: Boolean(m.audio?.voice),
+            path: saved?.path || null,
+            url: saved?.url || audLink || null,
+          };
+        } else if (m.type === "audio") {
+          messageData.media = { kind: "audio" };
         }
       }
 
       // === STICKER ===
-      if (m.type === "sticker" && m.sticker?.id) {
-        try {
-          const file = await fetchMedia(m.sticker.id);
-          if (file) {
-            const saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
-            messageData.media = {
-              kind: "sticker",
-              path: saved.path,
-              url: saved.url,
-              mime: file.mime,
-              size: file.buf.length,
-            };
+      if (m.type === "sticker") {
+        const stkId = m.sticker?.id || null;
+        let saved = null;
+        if (stkId) {
+          try {
+            const file = await fetchMedia(stkId);
+            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+          } catch (error) {
+            console.error("sticker error:", error);
           }
-        } catch (error) {
-          console.error("sticker error:", error);
+        }
+        if (saved?.url) {
+          messageData.media = {
+            kind: "sticker",
+            path: saved.path,
+            url: saved.url,
+          };
+        } else {
+          messageData.media = { kind: "sticker" }; // al menos marcar el tipo
         }
       }
 
       await convRef.collection("messages").doc(waMessageId).set(messageData, { merge: true });
-      console.log("🖼️ DEBUG Message saved to Firestore:", {
-        messageId: waMessageId,
+      console.log("🖼️ DEBUG Message saved:", {
+        waMessageId,
         type: messageData.type,
         hasMedia: !!messageData.media,
         mediaKind: messageData.media?.kind,
