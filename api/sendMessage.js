@@ -1,6 +1,5 @@
 // backend/api/sendMessage.js
 
-
 // ====== CORS ======
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*", // poné tu dominio en prod
@@ -99,7 +98,7 @@ export default async function handler(req, res) {
   try {
     if (!TOKEN) return res.status(500).json({ error: "server_misconfigured" });
 
-    // ⚠️ Import dinámico para que si firebaseAdmin.js rompe, no rompa el OPTIONS
+    // Import dinámico (para no romper OPTIONS)
     const { db, FieldValue } = await import("../lib/firebaseAdmin.js");
 
     const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
@@ -141,8 +140,7 @@ export default async function handler(req, res) {
           break; // al primer éxito, salimos
         }
         lastErr = r.json;
-        // si no es sandbox allow-list, no insistir
-        if (r?.json?.error?.code !== 131030) break;
+        if (r?.json?.error?.code !== 131030) break; // si no es sandbox allow-list, no insistir
       }
 
       const convId = normalizeE164AR(usedToDigits || cands[0]);
@@ -177,19 +175,23 @@ export default async function handler(req, res) {
         msgDoc.template = template?.name || null;
       }
       if (sentType === "image") {
+        const imgUrl = image?.link || image?.url || null; // aceptamos link o url
         msgDoc.media = {
           kind: "image",
-          ...(image?.link ? { link: image.link } : {}),
+          ...(imgUrl ? { link: imgUrl, url: imgUrl } : {}), // ⬅️ duplicamos para el front
           ...(image?.id ? { id: image.id } : {}),
           ...(image?.caption ? { caption: image.caption } : {}),
         };
+        if (imgUrl) msgDoc.mediaUrl = imgUrl; // ⬅️ compat con UI
       }
       if (sentType === "audio") {
+        const audUrl = audio?.link || audio?.url || null;
         msgDoc.media = {
           kind: "audio",
-          ...(audio?.link ? { link: audio.link } : {}),
+          ...(audUrl ? { link: audUrl, url: audUrl } : {}),
           ...(audio?.id ? { id: audio.id } : {}),
         };
+        if (audUrl) msgDoc.mediaUrl = audUrl;
       }
 
       Object.keys(msgDoc).forEach((k) => msgDoc[k] === undefined && delete msgDoc[k]);
@@ -207,7 +209,6 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: results.every(r => r.ok), results });
   } catch (err) {
-    // siempre devolver CORS también en error
     setCors(res);
     console.error("sendMessage error:", err);
     return res.status(500).json({ error: err.message || "internal_error" });
