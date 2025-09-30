@@ -1,6 +1,5 @@
 // backend/api/upload.js
-import { initializeApp, cert, getApps } from "firebase-admin/app";
-import { getStorage } from "firebase-admin/storage";
+import { bucket } from "../lib/firebaseAdmin.js";
 import Busboy from "busboy";
 
 // --- CORS ---
@@ -11,28 +10,6 @@ const corsHeaders = {
 };
 const send = (res, status, body = {}) =>
   res.writeHead(status, corsHeaders).end(JSON.stringify(body));
-
-// --- ENV / BUCKET ---
-const BUCKET = (process.env.FIREBASE_STORAGE_BUCKET || "").trim(); // 👈 evita espacios
-if (!BUCKET) {
-  console.error("FIREBASE_STORAGE_BUCKET missing");
-}
-
-// --- Admin init ---
-let initErr = null;
-try {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!raw) throw new Error("FIREBASE_SERVICE_ACCOUNT not set");
-  const SA = JSON.parse(raw);
-
-  if (!getApps().length) {
-    // No seteamos el bucket acá; lo forzamos más abajo con getStorage().bucket(BUCKET)
-    initializeApp({ credential: cert(SA) });
-  }
-} catch (e) {
-  initErr = e;
-  console.error("Admin init error:", e);
-}
 
 // --- multipart parser ---
 function readMultipartFile(req) {
@@ -70,14 +47,8 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return send(res, 204);
   if (req.method !== "POST") return send(res, 405, { ok:false, error:"Method not allowed" });
 
-  if (initErr) return send(res, 500, { ok:false, error:`Admin init: ${initErr.message}` });
-
   try {
-    const bucket = getStorage().bucket(BUCKET);        // 👈 forzamos bucket de la env
     if (!bucket?.name) throw new Error("Bucket not available");
-    if (bucket.name !== BUCKET) {
-      throw new Error(`Bucket mismatch: got ${bucket.name}, expected ${BUCKET}`);
-    }
 
     const { conversationId, filename, mime, buffer } = await readMultipartFile(req);
     if (!conversationId) return send(res, 400, { ok:false, error:"conversationId faltante" });

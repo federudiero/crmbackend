@@ -1,16 +1,5 @@
-// api/checkWebhookLogs.js
-// Endpoint para verificar logs recientes del webhook y detectar problemas con imágenes
-
-import admin from 'firebase-admin';
-
-// Inicializar Firebase Admin si no está inicializado
-if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: `https://${process.env.FB_PROJECT_ID}.firebaseio.com`
-  });
-}
+// testing/checkWebhookLogs.js
+import admin from "../lib/firebaseAdmin.js";
 
 const db = admin.firestore();
 
