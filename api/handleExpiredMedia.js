@@ -1,5 +1,5 @@
 // api/handleExpiredMedia.js
-import admin from "../lib/firebaseAdmin.js";
+import admin, { FieldValue } from "../lib/firebaseAdmin.js";
 
 const db = admin.firestore();
 
@@ -32,7 +32,7 @@ export default async function handler(req, res) {
         batch.update(docSnapshot.ref, {
           media_url: messageData.webhook_link,
           media_status: 'DOWNLOAD_FAILED_EXPIRED',
-          updated_at: admin.firestore.FieldValue.serverTimestamp()
+          updated_at: FieldValue.serverTimestamp()
         });
         updatedCount++;
       }
