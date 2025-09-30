@@ -1,5 +1,6 @@
 // backend/api/sendMessage.js
 
+
 // ====== CORS ======
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*", // poné tu dominio en prod
