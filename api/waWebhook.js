@@ -1,4 +1,4 @@
-// api/waWebhook.js — webhook WhatsApp con media entrante robusto
+// api/waWebhook.js — webhook WhatsApp con media entrante robusto + replyTo en entrantes
 import { db, FieldValue, bucket } from "../lib/firebaseAdmin.js";
 
 function cors(res) {
@@ -277,6 +277,54 @@ export default async function handler(req, res) {
         };
         messageData.media = Object.keys(media).length ? media : { kind: "sticker" };
       }
+
+      // === NUEVO: mapear reply del CLIENTE (context.message_id → replyTo) ===
+      try {
+        const ctxWamid = m?.context?.id || null; // WAMID del mensaje al que el cliente respondió
+        if (ctxWamid) {
+          // Objeto base (si no encontramos el original igual guardamos el WAMID)
+          const replyTo = {
+            id: ctxWamid,
+            wamid: ctxWamid,
+            type: "text",
+            text: "",
+            snippet: "",
+            from: null,
+            createdAt: null,
+          };
+
+          // Intentar enriquecer con datos del mensaje original si existe en nuestra DB
+          try {
+            const ref = db.collection("conversations").doc(convId).collection("messages").doc(ctxWamid);
+            const snap = await ref.get();
+            if (snap.exists) {
+              const orig = snap.data() || {};
+              replyTo.type =
+                orig?.media?.kind ||
+                orig?.type ||
+                (orig?.image ? "image" : orig?.audio ? "audio" : "text");
+              const visible = (
+                orig?.textPreview ||
+                orig?.text ||
+                orig?.body ||
+                orig?.caption ||
+                ""
+              ).toString();
+              replyTo.text = visible.slice(0, 200);
+              replyTo.snippet = replyTo.text;
+              replyTo.from = orig?.from || (orig?.direction === "out" ? "agent" : "client");
+              replyTo.createdAt = orig?.timestamp || null;
+            }
+          } catch (e) {
+            // Si falla la búsqueda, dejamos el objeto base con el wamid
+          }
+
+          messageData.replyTo = replyTo;
+        }
+      } catch (e) {
+        console.error("replyTo mapping error:", e);
+      }
+      // === FIN NUEVO ===
 
       // 🔒 BORRADOR ANTES DE GUARDAR (pegar justo antes del .set)
       // 🔒 borrar mime si quedó vacío/falsy
