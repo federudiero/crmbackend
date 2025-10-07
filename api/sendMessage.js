@@ -171,9 +171,34 @@ export default async function handler(req, res) {
       if (sentType === "text") {
         msgDoc.text = typeof text === "string" ? text : (text?.body || "");
       }
+
+      // === Nuevo: guardar template como objeto + textPreview ===
       if (sentType === "template") {
-        msgDoc.template = template?.name || null;
+        // Guardamos el objeto completo (para que el front lo pueda renderizar)
+        msgDoc.template = {
+          name: template?.name || null,
+          language: template?.language || null,
+          components: Array.isArray(template?.components) ? template.components : [],
+        };
+
+        // textPreview legible (tu HSM de reengagement tiene 3 variables)
+        try {
+          const comps = msgDoc.template.components?.[0]?.parameters || [];
+          const p = (i) => (typeof comps[i]?.text === "string" ? comps[i].text : "");
+          const p1 = p(0) || "¡Hola!";
+          const p2 = p(1) || "Equipo de Ventas";
+          const p3 = p(2) || "Tu Comercio";
+          msgDoc.textPreview =
+            `¡Hola ${p1}! Soy ${p2} de ${p3}.\n` +
+            `Te escribo para retomar tu consulta ya que pasaron más de 24 horas desde el último mensaje.\n` +
+            `Respondé a este mensaje para continuar la conversación.`;
+        } catch {
+          // fallback genérico si no vinieron parámetros
+          const name = msgDoc?.template?.name || "template";
+          msgDoc.textPreview = `[Plantilla ${name}]`;
+        }
       }
+
       if (sentType === "image") {
         const imgUrl = image?.link || image?.url || null; // aceptamos link o url
         msgDoc.media = {
@@ -184,6 +209,7 @@ export default async function handler(req, res) {
         };
         if (imgUrl) msgDoc.mediaUrl = imgUrl; // ⬅️ compat con UI
       }
+
       if (sentType === "audio") {
         const audUrl = audio?.link || audio?.url || null;
         msgDoc.media = {
