@@ -179,9 +179,18 @@ export default async function handler(req, res) {
       if (!convSnap.exists) baseConv.createdAt = FieldValue.serverTimestamp();
       await convRef.set(baseConv, { merge: true });
 
+      // ⬅️ NUEVO: marca inbound “ahora” (además de lastMessageAt)
+      await convRef.set(
+        {
+          lastInboundAt: FieldValue.serverTimestamp(),
+          lastMessageText: text || "",
+        },
+        { merge: true }
+      );
+
       // message base
       const messageData = {
-        direction: "in",
+        direction: "in", // ⬅️ tu lógica usa "in" para entrantes
         type: m.type || "text",
         text,
         timestamp: new Date(tsSec * 1000),
@@ -212,12 +221,12 @@ export default async function handler(req, res) {
         }
 
         // ⚙️ Construcción SIN 'undefined' usando spreads condicionales
-       const media = {
-  kind: "image",
-  ...(saved?.path ? { path: saved.path } : {}),
-  ...((saved?.url || imgLink) ? { url: saved?.url || imgLink } : {}),
-  ...(m.image?.mime_type ? { mime: m.image.mime_type } : {}), // 👈 solo si viene
-};
+        const media = {
+          kind: "image",
+          ...(saved?.path ? { path: saved.path } : {}),
+          ...((saved?.url || imgLink) ? { url: saved?.url || imgLink } : {}),
+          ...(m.image?.mime_type ? { mime: m.image.mime_type } : {}), // 👈 solo si viene
+        };
 
         // Si no hay ni url del storage ni link, marcamos el error
         if (!media.url) {
@@ -269,32 +278,78 @@ export default async function handler(req, res) {
         messageData.media = Object.keys(media).length ? media : { kind: "sticker" };
       }
 
-    // 🔒 BORRADOR ANTES DE GUARDAR (pegar justo antes del .set)
-// 🔒 borrar mime si quedó vacío/falsy
-if (messageData?.media && ('mime' in messageData.media) &&
-    (messageData.media.mime == null || messageData.media.mime === '')) {
-  delete messageData.media.mime;
-}
+      // 🔒 BORRADOR ANTES DE GUARDAR (pegar justo antes del .set)
+      // 🔒 borrar mime si quedó vacío/falsy
+      if (messageData?.media && ('mime' in (messageData.media || {})) &&
+          (messageData.media.mime == null || messageData.media.mime === '')) {
+        delete messageData.media.mime;
+      }
 
-// 💎 limpieza total: elimina cualquier undefined anidado
-const cleanMessage = JSON.parse(JSON.stringify(messageData));
+      // 💎 limpieza total: elimina cualquier undefined anidado
+      const cleanMessage = JSON.parse(JSON.stringify(messageData));
 
-// (opcional) log para verificar en prod
-console.log("🧹 MessageData final:", JSON.stringify(cleanMessage));
+      // (opcional) log para verificar en prod
+      console.log("🧹 MessageData final:", JSON.stringify(cleanMessage));
 
-// ✅ guardar sin undefined
-await convRef
-  .collection("messages")
-  .doc(waMessageId)
-  .set(cleanMessage, { merge: true });
+      // ✅ guardar sin undefined
+      await convRef
+        .collection("messages")
+        .doc(waMessageId)
+        .set(cleanMessage, { merge: true });
 
       console.log("🖼️ DEBUG Message saved:", {
         waMessageId,
         type: messageData.type,
         hasMedia: !!messageData.media,
         mediaKind: messageData.media?.kind,
-       
       });
+
+      // 🔔 NOTIFICACIÓN FCM (solo si la conversación está asignada a alguien)
+      try {
+        const snap2 = await convRef.get();
+        const assignedToUid = snap2.get("assignedToUid");
+        if (assignedToUid) {
+          // 1) tokens del usuario asignado
+          const pushDoc = await db.doc(`users/${assignedToUid}/meta/push`).get();
+          const tokens = pushDoc.exists ? (pushDoc.get("tokens") || []) : [];
+
+          if (tokens.length) {
+            // Base por entorno: PROD usa tu dominio; DEV usa localhost:5174
+const FRONTEND_BASE =
+  process.env.FRONTEND_BASE_URL ||
+  (process.env.VERCEL_ENV === "production"
+    ? "https://crmhogarcril.com"
+    : "http://localhost:5174");
+
+// 👉 Deep-link correcto a tu app:
+const url = `${FRONTEND_BASE}/home?conv=${encodeURIComponent(convId)}`;
+
+            // 3) enviar
+            const admin = (await import("firebase-admin")).default;
+            const resp = await admin.messaging().sendEachForMulticast({
+              tokens,
+              notification: {
+                title: "Nuevo mensaje",
+                body: text || "Toca para abrir la conversación",
+              },
+              data: { url, convId: convId },
+              webpush: { fcmOptions: { link: url } },
+            });
+
+            // 4) limpiar tokens inválidos
+            const invalid = [];
+            resp.responses.forEach((r, i) => { if (!r.success) invalid.push(tokens[i]); });
+            if (invalid.length) {
+              await db.doc(`users/${assignedToUid}/meta/push`).set(
+                { tokens: tokens.filter(t => !invalid.includes(t)) },
+                { merge: true }
+              );
+            }
+          }
+        }
+      } catch (err) {
+        console.error("🔔 notify error:", err);
+      }
     }
 
     // ===== ESTADOS =====
