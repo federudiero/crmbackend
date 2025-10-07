@@ -102,7 +102,7 @@ export default async function handler(req, res) {
     const { db, FieldValue } = await import("../lib/firebaseAdmin.js");
 
     const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
-    let { to, text, template, image, audio, fromWaPhoneId, phoneId } = body;
+    let { to, text, template, image, audio, fromWaPhoneId, phoneId, replyTo } = body;
 
     if (!to) return res.status(400).json({ error: "missing_to" });
     if (!text && !template && !image && !audio) {
@@ -131,6 +131,12 @@ export default async function handler(req, res) {
         } else {
           payload = { type: "text", text: { body: typeof text === "string" ? text : (text?.body || ""), preview_url: false } };
         }
+
+        // Contexto de respuesta (WhatsApp Business API requiere "context: { message_id }")
+        const ctxId = replyTo?.wamid || replyTo?.id;
+if (ctxId) {
+  payload.context = { message_id: String(ctxId) };
+}
 
         const r = await sendToGraph(PHONE_ID, cand, payload);
         if (r.ok) {
@@ -221,6 +227,20 @@ export default async function handler(req, res) {
       }
 
       Object.keys(msgDoc).forEach((k) => msgDoc[k] === undefined && delete msgDoc[k]);
+
+      // Persistir replyTo expandido (compat front/back con text/snippet)
+      if (replyTo) {
+        msgDoc.replyTo = {
+          id: replyTo.id || null,
+          type: replyTo.type || "text",
+          text: (replyTo.text || replyTo.snippet || "").slice(0, 200),
+          snippet: (replyTo.snippet || replyTo.text || "").slice(0, 200),
+          wamid: replyTo.wamid || null,
+          from: replyTo.from || null,
+          createdAt: replyTo.createdAt || null,
+        };
+      }
+
       await convRef.collection("messages").doc(wamid).set(msgDoc, { merge: true });
 
       results.push({
