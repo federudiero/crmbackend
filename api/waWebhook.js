@@ -260,6 +260,32 @@ export default async function handler(req, res) {
         messageData.media = Object.keys(media).length ? media : { kind: "audio" };
       }
 
+
+// === LOCATION ===
+if (m.type === "location") {
+  const lat = Number(m?.location?.latitude);
+  const lng = Number(m?.location?.longitude);
+  const name = m?.location?.name || null;        // p.ej. "Mi casa"
+  const address = m?.location?.address || null;  // p.ej. "Balcarce 472, Rosario"
+  // Enlace de mapa universal
+  const gmaps = (Number.isFinite(lat) && Number.isFinite(lng))
+    ? `https://www.google.com/maps?q=${lat},${lng}`
+    : null;
+
+  messageData.location = {
+    lat, lng,
+    ...(name ? { name } : {}),
+    ...(address ? { address } : {}),
+    ...(gmaps ? { url: gmaps } : {}),
+  };
+  // Para que el front pueda detectar fácil
+  messageData.type = "location";
+  messageData.textPreview = address || name || "Ubicación";
+  // Si querés además guardarlo “al estilo media”
+  messageData.media = { kind: "location" };
+}
+
+
       // === STICKER ===
       if (m.type === "sticker") {
         const stkId = m.sticker?.id || null;
