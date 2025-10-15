@@ -1,5 +1,6 @@
-// api/waWebhook.js — webhook WhatsApp con media entrante robusto + replyTo en entrantes
+// api/waWebhook.js — webhook WhatsApp con media entrante robusto + replyTo en entrantes + EMAIL AL VENDEDOR
 import { db, FieldValue, bucket } from "../lib/firebaseAdmin.js";
+import { sendEmail } from "../lib/email.js"; // 👈 NUEVO: helper de email
 
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -179,7 +180,7 @@ export default async function handler(req, res) {
       if (!convSnap.exists) baseConv.createdAt = FieldValue.serverTimestamp();
       await convRef.set(baseConv, { merge: true });
 
-      // ⬅️ NUEVO: marca inbound “ahora” (además de lastMessageAt)
+      // marca inbound “ahora” (además de lastMessageAt)
       await convRef.set(
         {
           lastInboundAt: FieldValue.serverTimestamp(),
@@ -190,7 +191,7 @@ export default async function handler(req, res) {
 
       // message base
       const messageData = {
-        direction: "in", // ⬅️ tu lógica usa "in" para entrantes
+        direction: "in", // tu lógica usa "in" para entrantes
         type: m.type || "text",
         text,
         timestamp: new Date(tsSec * 1000),
@@ -202,7 +203,7 @@ export default async function handler(req, res) {
       // === IMAGEN ===
       if (m.type === "image") {
         const imgId   = m.image?.id || null;
-        const imgLink = m.image?.link || null; // rara vez viene
+        const imgLink = m.image?.link || null;
 
         console.log("🖼️ DEBUG Webhook Image:", { waMessageId, convId, hasId: !!imgId, hasLink: !!imgLink });
 
@@ -220,15 +221,13 @@ export default async function handler(req, res) {
           }
         }
 
-        // ⚙️ Construcción SIN 'undefined' usando spreads condicionales
         const media = {
           kind: "image",
           ...(saved?.path ? { path: saved.path } : {}),
           ...((saved?.url || imgLink) ? { url: saved?.url || imgLink } : {}),
-          ...(m.image?.mime_type ? { mime: m.image.mime_type } : {}), // 👈 solo si viene
+          ...(m.image?.mime_type ? { mime: m.image.mime_type } : {}),
         };
 
-        // Si no hay ni url del storage ni link, marcamos el error
         if (!media.url) {
           console.warn("🖼️ WARNING: Image message without valid URL", { waMessageId, imgId: !!imgId, imgLink: !!imgLink });
           messageData.media = { kind: "image" };
@@ -236,7 +235,7 @@ export default async function handler(req, res) {
           messageData.mediaError = "DOWNLOAD_FAILED_EXPIRED";
         } else {
           messageData.media = media;
-          messageData.mediaUrl = media.url; // compat con UI
+          messageData.mediaUrl = media.url;
         }
       }
 
@@ -260,31 +259,26 @@ export default async function handler(req, res) {
         messageData.media = Object.keys(media).length ? media : { kind: "audio" };
       }
 
+      // === LOCATION ===
+      if (m.type === "location") {
+        const lat = Number(m?.location?.latitude);
+        const lng = Number(m?.location?.longitude);
+        const name = m?.location?.name || null;
+        const address = m?.location?.address || null;
+        const gmaps = (Number.isFinite(lat) && Number.isFinite(lng))
+          ? `https://www.google.com/maps?q=${lat},${lng}`
+          : null;
 
-// === LOCATION ===
-if (m.type === "location") {
-  const lat = Number(m?.location?.latitude);
-  const lng = Number(m?.location?.longitude);
-  const name = m?.location?.name || null;        // p.ej. "Mi casa"
-  const address = m?.location?.address || null;  // p.ej. "Balcarce 472, Rosario"
-  // Enlace de mapa universal
-  const gmaps = (Number.isFinite(lat) && Number.isFinite(lng))
-    ? `https://www.google.com/maps?q=${lat},${lng}`
-    : null;
-
-  messageData.location = {
-    lat, lng,
-    ...(name ? { name } : {}),
-    ...(address ? { address } : {}),
-    ...(gmaps ? { url: gmaps } : {}),
-  };
-  // Para que el front pueda detectar fácil
-  messageData.type = "location";
-  messageData.textPreview = address || name || "Ubicación";
-  // Si querés además guardarlo “al estilo media”
-  messageData.media = { kind: "location" };
-}
-
+        messageData.location = {
+          lat, lng,
+          ...(name ? { name } : {}),
+          ...(address ? { address } : {}),
+          ...(gmaps ? { url: gmaps } : {}),
+        };
+        messageData.type = "location";
+        messageData.textPreview = address || name || "Ubicación";
+        messageData.media = { kind: "location" };
+      }
 
       // === STICKER ===
       if (m.type === "sticker") {
@@ -304,11 +298,10 @@ if (m.type === "location") {
         messageData.media = Object.keys(media).length ? media : { kind: "sticker" };
       }
 
-      // === NUEVO: mapear reply del CLIENTE (context.message_id → replyTo) ===
+      // === reply del CLIENTE (context.message_id → replyTo) ===
       try {
-        const ctxWamid = m?.context?.id || null; // WAMID del mensaje al que el cliente respondió
+        const ctxWamid = m?.context?.id || null;
         if (ctxWamid) {
-          // Objeto base (si no encontramos el original igual guardamos el WAMID)
           const replyTo = {
             id: ctxWamid,
             wamid: ctxWamid,
@@ -318,8 +311,6 @@ if (m.type === "location") {
             from: null,
             createdAt: null,
           };
-
-          // Intentar enriquecer con datos del mensaje original si existe en nuestra DB
           try {
             const ref = db.collection("conversations").doc(convId).collection("messages").doc(ctxWamid);
             const snap = await ref.get();
@@ -341,35 +332,23 @@ if (m.type === "location") {
               replyTo.from = orig?.from || (orig?.direction === "out" ? "agent" : "client");
               replyTo.createdAt = orig?.timestamp || null;
             }
-          } catch (e) {
-            // Si falla la búsqueda, dejamos el objeto base con el wamid
-          }
-
+          } catch {}
           messageData.replyTo = replyTo;
         }
       } catch (e) {
         console.error("replyTo mapping error:", e);
       }
-      // === FIN NUEVO ===
 
-      // 🔒 BORRADOR ANTES DE GUARDAR (pegar justo antes del .set)
-      // 🔒 borrar mime si quedó vacío/falsy
+      // 🔒 limpieza
       if (messageData?.media && ('mime' in (messageData.media || {})) &&
           (messageData.media.mime == null || messageData.media.mime === '')) {
         delete messageData.media.mime;
       }
-
-      // 💎 limpieza total: elimina cualquier undefined anidado
       const cleanMessage = JSON.parse(JSON.stringify(messageData));
-
-      // (opcional) log para verificar en prod
       console.log("🧹 MessageData final:", JSON.stringify(cleanMessage));
 
-      // ✅ guardar sin undefined
-      await convRef
-        .collection("messages")
-        .doc(waMessageId)
-        .set(cleanMessage, { merge: true });
+      // ✅ guardar mensaje
+      await convRef.collection("messages").doc(waMessageId).set(cleanMessage, { merge: true });
 
       console.log("🖼️ DEBUG Message saved:", {
         waMessageId,
@@ -378,27 +357,28 @@ if (m.type === "location") {
         mediaKind: messageData.media?.kind,
       });
 
-      // 🔔 NOTIFICACIÓN FCM (solo si la conversación está asignada a alguien)
+      // 🔔 PUSH FCM + ✉️ EMAIL (si hay asignado)
       try {
         const snap2 = await convRef.get();
         const assignedToUid = snap2.get("assignedToUid");
+        const assignedToEmailInConv = snap2.get("assignedToEmail") || null;
+
         if (assignedToUid) {
-          // 1) tokens del usuario asignado
+          // 1) tokens FCM del asignado
           const pushDoc = await db.doc(`users/${assignedToUid}/meta/push`).get();
           const tokens = pushDoc.exists ? (pushDoc.get("tokens") || []) : [];
 
+          // Base por entorno: PROD usa tu dominio; DEV usa localhost:5174
+          const FRONTEND_BASE =
+            process.env.FRONTEND_BASE_URL ||
+            (process.env.VERCEL_ENV === "production"
+              ? "https://crmhogarcril.com"
+              : "http://localhost:5174");
+
+          const url = `${FRONTEND_BASE}/home/${encodeURIComponent(convId)}`;
+
+          // 2) Enviar PUSH (si hay tokens)
           if (tokens.length) {
-            // Base por entorno: PROD usa tu dominio; DEV usa localhost:5174
-const FRONTEND_BASE =
-  process.env.FRONTEND_BASE_URL ||
-  (process.env.VERCEL_ENV === "production"
-    ? "https://crmhogarcril.com"
-    : "http://localhost:5174");
-
-// 👉 Deep-link correcto a tu app:
-const url = `${FRONTEND_BASE}/home?conv=${encodeURIComponent(convId)}`;
-
-            // 3) enviar
             const admin = (await import("firebase-admin")).default;
             const resp = await admin.messaging().sendEachForMulticast({
               tokens,
@@ -406,11 +386,11 @@ const url = `${FRONTEND_BASE}/home?conv=${encodeURIComponent(convId)}`;
                 title: "Nuevo mensaje",
                 body: text || "Toca para abrir la conversación",
               },
-              data: { url, convId: convId },
+              data: { url, conversationId: convId },
               webpush: { fcmOptions: { link: url } },
             });
 
-            // 4) limpiar tokens inválidos
+            // limpiar tokens inválidos
             const invalid = [];
             resp.responses.forEach((r, i) => { if (!r.success) invalid.push(tokens[i]); });
             if (invalid.length) {
@@ -420,9 +400,43 @@ const url = `${FRONTEND_BASE}/home?conv=${encodeURIComponent(convId)}`;
               );
             }
           }
+
+          // 3) Enviar EMAIL (best-effort; no rompe el webhook si falla)
+          try {
+            let to = assignedToEmailInConv;
+            if (!to) {
+              const u = await db.collection("users").doc(String(assignedToUid)).get();
+              to = u.exists ? (u.get("email") || u.get("assignedToEmail") || null) : null;
+            }
+            if (to) {
+              const who = contactData?.phone || convId;
+              const preview = text || (messageData?.media?.kind ? `[${messageData.media.kind}]` : "Nuevo mensaje");
+              await sendEmail({
+                to,
+                subject: `Nuevo mensaje de ${who}`,
+                html: `
+                  <div style="font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;line-height:1.45">
+                    <p><strong>Nuevo mensaje entrante</strong></p>
+                    <p><b>Conversación:</b> ${who}</p>
+                    <p><b>Texto:</b> ${String(preview).replace(/</g,"&lt;")}</p>
+                    <p>
+                      <a href="${url}" style="display:inline-block;padding:10px 14px;background:#2E7D32;color:#fff;text-decoration:none;border-radius:6px">
+                        Abrir conversación
+                      </a>
+                    </p>
+                    <p style="color:#6b7280;font-size:12px">Si el botón no funciona, copia y pega:<br>${url}</p>
+                  </div>
+                `.trim()
+              });
+            } else {
+              console.log("[email] omitido: no hay email para assignedToUid=", assignedToUid);
+            }
+          } catch (e) {
+            console.error("[email] error enviando mail al vendedor:", e);
+          }
         }
       } catch (err) {
-        console.error("🔔 notify error:", err);
+        console.error("🔔 notify/email error:", err);
       }
     }
 
