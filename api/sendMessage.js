@@ -102,10 +102,10 @@ export default async function handler(req, res) {
     const { db, FieldValue } = await import("../lib/firebaseAdmin.js");
 
     const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
-    let { to, text, template, image, audio, fromWaPhoneId, phoneId, replyTo } = body;
+    let { to, text, template, image, audio, document, fromWaPhoneId, phoneId, replyTo } = body;
 
     if (!to) return res.status(400).json({ error: "missing_to" });
-    if (!text && !template && !image && !audio) {
+    if (!text && !template && !image && !audio && !document) {
       return res.status(400).json({ error: "missing_text_or_template_or_media" });
     }
 
@@ -126,6 +126,8 @@ export default async function handler(req, res) {
           payload = { type: "image", image };
         } else if (audio) {
           payload = { type: "audio", audio };
+        } else if (document) {
+          payload = { type: "document", document };
         } else if (template) {
           payload = { type: "template", template };
         } else {
@@ -159,7 +161,7 @@ if (ctxId) {
       const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
 
       // tipo realmente enviado
-      const sentType = image ? "image" : audio ? "audio" : (template ? "template" : "text");
+      const sentType = image ? "image" : audio ? "audio" : document ? "document" : (template ? "template" : "text");
 
       const msgDoc = {
         direction: "out",
@@ -224,6 +226,18 @@ if (ctxId) {
           ...(audio?.id ? { id: audio.id } : {}),
         };
         if (audUrl) msgDoc.mediaUrl = audUrl;
+      }
+
+      if (sentType === "document") {
+        const docUrl = document?.link || document?.url || null;
+        msgDoc.media = {
+          kind: "document",
+          ...(docUrl ? { link: docUrl, url: docUrl } : {}),
+          ...(document?.id ? { id: document.id } : {}),
+          ...(document?.caption ? { caption: document.caption } : {}),
+          ...(document?.filename ? { filename: document.filename } : {}),
+        };
+        if (docUrl) msgDoc.mediaUrl = docUrl;
       }
 
       Object.keys(msgDoc).forEach((k) => msgDoc[k] === undefined && delete msgDoc[k]);

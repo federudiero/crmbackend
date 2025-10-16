@@ -259,6 +259,46 @@ export default async function handler(req, res) {
         messageData.media = Object.keys(media).length ? media : { kind: "audio" };
       }
 
+      // === DOCUMENT ===
+      if (m.type === "document") {
+        const docId   = m.document?.id || null;
+        const docLink = m.document?.link || null;
+
+        console.log("📄 DEBUG Webhook Document:", { waMessageId, convId, hasId: !!docId, hasLink: !!docLink });
+
+        let saved = null;
+        if (docId) {
+          try {
+            const file = await fetchMedia(docId);
+            console.log("📄 DEBUG Fetched document:", { ok: !!file, mime: file?.mime, size: file?.buf?.length });
+            if (file) {
+              saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+              console.log("📄 DEBUG Saved document:", saved);
+            }
+          } catch (error) {
+            console.error("📄 ERROR downloading/saving document:", error);
+          }
+        }
+
+        const media = {
+          kind: "document",
+          ...(m.document?.filename ? { filename: m.document.filename } : {}),
+          ...(saved?.path ? { path: saved.path } : {}),
+          ...((saved?.url || docLink) ? { url: saved?.url || docLink } : {}),
+          ...(m.document?.mime_type ? { mime: m.document.mime_type } : {}),
+        };
+
+        if (!media.url) {
+          console.warn("📄 WARNING: Document message without valid URL", { waMessageId, docId: !!docId, docLink: !!docLink });
+          messageData.media = { kind: "document", ...(media.filename ? { filename: media.filename } : {}) };
+          messageData.hasMedia = true;
+          messageData.mediaError = "DOWNLOAD_FAILED_EXPIRED";
+        } else {
+          messageData.media = media;
+          messageData.mediaUrl = media.url;
+        }
+      }
+
       // === LOCATION ===
       if (m.type === "location") {
         const lat = Number(m?.location?.latitude);

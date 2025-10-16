@@ -60,8 +60,8 @@ export default async function handler(req, res) {
     if (!buffer?.length)
       return send(res, 400, { ok: false, error: "archivo faltante" });
 
-    // Validaciones estilo WhatsApp
-    if (!/^(image|audio)\//.test(mime))
+    // Validaciones estilo WhatsApp (+ PDF documentos)
+    if (!/^(image|audio)\//.test(mime) && mime !== "application/pdf")
       return send(res, 415, { ok: false, error: "Tipo no permitido" });
     if (buffer.length > 25 * 1024 * 1024)
       return send(res, 413, { ok: false, error: "Archivo > 25MB" });
