@@ -21,6 +21,23 @@ function normalizeE164AR(waIdOrPhone) {
   return `+${d}`;
 }
 function extractTextFromMessage(m) {
+  // Manejo específico para contactos: evita "mensaje vacío" en el chat
+  if (m?.type === "contacts") {
+    const c = Array.isArray(m.contacts) ? m.contacts[0] : undefined;
+    // Nombre: formatted_name o first_name + last_name
+    const formatted = c?.name?.formatted_name;
+    const first = c?.name?.first_name;
+    const last = c?.name?.last_name;
+    const name = (formatted || [first, last].filter(Boolean).join(" ")).trim();
+    // Teléfono: prioridad wa_id, luego phone, luego value
+    const ph = c?.phones?.[0]?.wa_id || c?.phones?.[0]?.phone || c?.phones?.[0]?.value || "";
+    const phone = ph ? `+${digits(ph)}` : "";
+    const parts = [name || null, phone || null].filter(Boolean);
+    if (parts.length) {
+      return `📇 Contacto: ${parts.join(" · ")}`;
+    }
+    return "📇 Contacto"; // fallback genérico si no hay datos
+  }
   return (
     m.text?.body ||
     m.interactive?.nfm_reply?.body ||
@@ -162,7 +179,8 @@ export default async function handler(req, res) {
       const contactSnap = await contactRef.get();
       const contactData = {
         phone: convId,
-        waId: digits(convId).slice(1),
+       waId: digits(convId),
+
         updatedAt: FieldValue.serverTimestamp(),
       };
       if (!contactSnap.exists) contactData.createdAt = FieldValue.serverTimestamp();
@@ -199,6 +217,28 @@ export default async function handler(req, res) {
         businessDisplay: phoneDisplay,
         raw: m,
       };
+
+      // === CONTACTS ===
+      if (m.type === "contacts") {
+        const c = Array.isArray(m.contacts) ? m.contacts[0] : undefined;
+        const formatted = c?.name?.formatted_name;
+        const first = c?.name?.first_name;
+        const last = c?.name?.last_name;
+        const name = (formatted || [first, last].filter(Boolean).join(" ")).trim() || null;
+
+        const ph = c?.phones?.[0]?.wa_id || c?.phones?.[0]?.phone || c?.phones?.[0]?.value || "";
+        const phone = ph ? `+${digits(ph)}` : null;
+
+        // Enriquecer messageData con objeto contacto (opcional)
+        messageData.contact = stripUndefined({ name, phone, raw: c });
+
+        // Si el texto quedó vacío, completar con string legible
+        if (!messageData.text || messageData.text.trim() === "") {
+          const parts = [name, phone].filter(Boolean);
+          messageData.text = parts.length ? `📇 Contacto: ${parts.join(" · ")}` : "📇 Contacto";
+        }
+          messageData.textPreview = messageData.text;
+      }
 
       // === IMAGEN ===
       if (m.type === "image") {
