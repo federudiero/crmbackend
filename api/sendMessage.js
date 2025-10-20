@@ -84,6 +84,37 @@ async function resolvePhoneIdFor(db, toRaw, explicitPhoneId, defaultPhoneId) {
   return defaultPhoneId;
 }
 
+// ---------- helper preview ----------
+function buildPreviewForSent({ sentType, text, template, image, audio, document }) {
+  if (sentType === "text") {
+    return typeof text === "string" ? text : (text?.body || "");
+  }
+  if (sentType === "template") {
+    // si el front armó el objeto, intentar una vista previa legible
+    try {
+      const comps = Array.isArray(template?.components) ? template.components : [];
+      const params = comps?.[0]?.parameters || [];
+      const p = (i) => (typeof params[i]?.text === "string" ? params[i].text : "");
+      const p1 = p(0) || "¡Hola!";
+      const p2 = p(1) || "Equipo de Ventas";
+      const p3 = p(2) || "Tu Comercio";
+      return `¡Hola ${p1}! Soy ${p2} de ${p3}.`;
+    } catch {
+      return `[Plantilla ${template?.name || "enviada"}]`;
+    }
+  }
+  if (sentType === "image") {
+    return image?.caption || "[Imagen]";
+  }
+  if (sentType === "audio") {
+    return "[Audio]";
+  }
+  if (sentType === "document") {
+    return document?.caption || "[Documento]";
+  }
+  return "";
+}
+
 // ====== HANDLER ======
 export default async function handler(req, res) {
   setCors(res);
@@ -136,9 +167,9 @@ export default async function handler(req, res) {
 
         // Contexto de respuesta (WhatsApp Business API requiere "context: { message_id }")
         const ctxId = replyTo?.wamid || replyTo?.id;
-if (ctxId) {
-  payload.context = { message_id: String(ctxId) };
-}
+        if (ctxId) {
+          payload.context = { message_id: String(ctxId) };
+        }
 
         const r = await sendToGraph(PHONE_ID, cand, payload);
         if (r.ok) {
@@ -189,7 +220,7 @@ if (ctxId) {
           components: Array.isArray(template?.components) ? template.components : [],
         };
 
-        // textPreview legible (tu HSM de reengagement tiene 3 variables)
+        // textPreview legible (HSM de reengagement con 3 variables)
         try {
           const comps = msgDoc.template.components?.[0]?.parameters || [];
           const p = (i) => (typeof comps[i]?.text === "string" ? comps[i].text : "");
@@ -201,7 +232,6 @@ if (ctxId) {
             `Te escribo para retomar tu consulta ya que pasaron más de 24 horas desde el último mensaje.\n` +
             `Respondé a este mensaje para continuar la conversación.`;
         } catch {
-          // fallback genérico si no vinieron parámetros
           const name = msgDoc?.template?.name || "template";
           msgDoc.textPreview = `[Plantilla ${name}]`;
         }
@@ -255,7 +285,29 @@ if (ctxId) {
         };
       }
 
+      // === Guardar mensaje ===
       await convRef.collection("messages").doc(wamid).set(msgDoc, { merge: true });
+
+      // === 👇 NUEVO: actualizar meta de conversación (preview) ===
+      const preview = buildPreviewForSent({
+        sentType,
+        text,
+        template,
+        image,
+        audio,
+        document,
+      });
+
+      await convRef.set(
+        {
+          contactId: convId,
+          lastMessageAt: FieldValue.serverTimestamp(),
+          lastMessageText: String(preview || "").slice(0, 500),
+          lastMessageDirection: "out",
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
 
       results.push({
         to: convId,
