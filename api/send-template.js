@@ -1,9 +1,7 @@
-// api/waba/send-template.js — Vercel Serverless
 // Envía SIEMPRE la plantilla promo_hogarcril_combos (es_AR).
 // Selecciona el PHONE_ID según el email del vendedor (Firebase Auth).
-
 import { getFirestore } from "firebase-admin/firestore";
-import admin from "../../lib/firebaseAdmin.js";
+import admin from "../lib/firebaseAdmin.js";
 
 const EMAIL_TO_ENV = {
   "christian15366@gmail.com": "META_WA_PHONE_ID_0453",
@@ -20,15 +18,16 @@ export default async function handler(req, res) {
     if (req.method === "OPTIONS") return res.status(204).end();
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // 1) Auth
+    // Auth: Firebase ID token
     const auth = req.headers.authorization || "";
     const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing Bearer token" });
 
-    let decoded; try { decoded = await admin.auth().verifyIdToken(idToken); }
+    let decoded; 
+    try { decoded = await admin.auth().verifyIdToken(idToken); }
     catch { return res.status(401).json({ error: "Invalid token" }); }
 
-    // 2) Resolver PHONE_ID por email (o por sellers/{uid} si existiera)
+    // Resolver PHONE_ID (doc sellers/{uid} o por email)
     const db = getFirestore();
     const uid = decoded.uid;
     const email = (decoded.email || "").toLowerCase();
@@ -37,7 +36,7 @@ export default async function handler(req, res) {
     try {
       const doc = await db.collection("sellers").doc(uid).get();
       if (doc.exists) phoneEnvKey = doc.data()?.phoneEnvKey || null;
-    } catch (_) {}
+    } catch {}
 
     if (!phoneEnvKey && email) phoneEnvKey = EMAIL_TO_ENV[email] || "META_WA_PHONE_ID";
 
@@ -52,12 +51,12 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: `Missing PHONE_ID (${phoneEnvKey}) or META_WA_TOKEN` });
     }
 
-    // 3) Body
+    // Body
     const payloadIn = await readJson(req);
     const { phone, components = [] } = payloadIn || {};
     if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-    // 4) Payload bloqueado
+    // Payload bloqueado
     const payload = {
       messaging_product: "whatsapp",
       to: phone,
@@ -69,14 +68,15 @@ export default async function handler(req, res) {
       },
     };
 
-    // 5) Envío
+    // Envío
     const r = await fetch(`https://graph.facebook.com/v21.0/${PHONE_ID}/messages`, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
-    const txt = await r.text(); let data; try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+    const txt = await r.text(); 
+    let data; try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
     if (!r.ok) return res.status(r.status).json({ error: data?.error || data });
 
     return res.status(200).json({ ok: true, data, from_phone_id: PHONE_ID, seller_uid: uid, seller_email: email, phoneEnvKey });

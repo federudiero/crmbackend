@@ -1,8 +1,6 @@
-// api/waba/sender.js — Vercel Serverless
 // Devuelve el Phone ID (y env var) que usará el vendedor logueado.
-
 import { getFirestore } from "firebase-admin/firestore";
-import admin from "../../lib/firebaseAdmin.js";
+import admin from "../lib/firebaseAdmin.js";
 
 const EMAIL_TO_ENV = {
   "christian15366@gmail.com": "META_WA_PHONE_ID_0453",
@@ -23,7 +21,8 @@ export default async function handler(req, res) {
     const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing Bearer token" });
 
-    let decoded; try { decoded = await admin.auth().verifyIdToken(idToken); }
+    let decoded; 
+    try { decoded = await admin.auth().verifyIdToken(idToken); }
     catch { return res.status(401).json({ error: "Invalid token" }); }
 
     const db = getFirestore();
@@ -34,7 +33,7 @@ export default async function handler(req, res) {
     try {
       const doc = await db.collection("sellers").doc(uid).get();
       if (doc.exists) phoneEnvKey = doc.data()?.phoneEnvKey || null;
-    } catch (_) {}
+    } catch {}
 
     if (!phoneEnvKey && email) phoneEnvKey = EMAIL_TO_ENV[email] || "META_WA_PHONE_ID";
 

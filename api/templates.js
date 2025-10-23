@@ -1,6 +1,4 @@
-// api/waba/templates.js — Vercel Serverless
 // Devuelve SOLO la plantilla promo_hogarcril_combos (es_AR) si está APPROVED/MARKETING.
-
 export default async function handler(req, res) {
   try {
     if (req.method === "OPTIONS") return res.status(204).end();
@@ -17,7 +15,9 @@ export default async function handler(req, res) {
       process.env.META_WABA_BUSINESS_ID;
 
     const TOKEN = process.env.META_WA_TOKEN;
-    if (!WABA_ID || !TOKEN) return res.status(500).json({ error: "Missing META_WA_TOKEN or WABA ID" });
+    if (!WABA_ID || !TOKEN) {
+      return res.status(500).json({ error: "Missing META_WA_TOKEN or WABA ID" });
+    }
 
     let url = `https://graph.facebook.com/v21.0/${WABA_ID}/message_templates?limit=100`;
     const all = [];
@@ -47,8 +47,8 @@ export default async function handler(req, res) {
 
     const filtered = mapped.filter(t =>
       t.name === "promo_hogarcril_combos" &&
-      t.language === "es_AR" &&
-      t.status === "APPROVED" &&
+      (t.language === "es_AR" || t.language?.code === "es_AR") &&
+      String(t.status).toUpperCase() === "APPROVED" &&
       String(t.category).toUpperCase() === "MARKETING"
     );
 
