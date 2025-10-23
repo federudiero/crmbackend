@@ -1,14 +1,25 @@
+// /api/templates.js
 // Devuelve SOLO la plantilla promo_hogarcril_combos (es_AR) si está APPROVED/MARKETING.
+
+function setCors(req, res) {
+  const ALLOWED = (process.env.ALLOWED_ORIGIN || "https://crmhogarcril.com,http://localhost:5174")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  const origin = req.headers.origin || "";
+  if (ALLOWED.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
+
 export default async function handler(req, res) {
+  setCors(req, res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
+
   try {
-    if (req.method === "OPTIONS") return res.status(204).end();
-    if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed" });
-
-    const ORIGIN = process.env.ALLOWED_ORIGIN || "https://crmhogarcril.com";
-    res.setHeader("Access-Control-Allow-Origin", ORIGIN);
-    res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-
     const WABA_ID =
       process.env.META_WABA_ID ||
       process.env.META_WA_BUSINESS_ID ||
@@ -34,7 +45,8 @@ export default async function handler(req, res) {
     const mapped = all.map((t) => {
       const body = (t?.components || []).find((c) => c.type === "BODY");
       const text = body?.text || "";
-      const nums = [...new Set([...text.matchAll(/\{\{(\d+)\}\}/g)].map(m => parseInt(m[1],10)))].sort((a,b)=>a-b);
+      const nums = [...new Set([...text.matchAll(/\{\{(\d+)\}\}/g)]
+        .map(m => parseInt(m[1],10)))].sort((a,b)=>a-b);
       return {
         name: t.name,
         status: t.status,

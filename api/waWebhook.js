@@ -179,7 +179,7 @@ export default async function handler(req, res) {
       const contactSnap = await contactRef.get();
       const contactData = {
         phone: convId,
-       waId: digits(convId),
+        waId: digits(convId),
 
         updatedAt: FieldValue.serverTimestamp(),
       };
@@ -195,7 +195,11 @@ export default async function handler(req, res) {
         lastInboundPhoneId: phoneId,
         lastInboundDisplay: phoneDisplay,
       };
-      if (!convSnap.exists) baseConv.createdAt = FieldValue.serverTimestamp();
+      // 👇 ÚNICO cambio de lógica: además de createdAt, guardamos firstInboundAt la PRIMERA VEZ
+      if (!convSnap.exists) {
+        baseConv.createdAt = FieldValue.serverTimestamp();
+        baseConv.firstInboundAt = FieldValue.serverTimestamp(); // 👈 clave para “Nuevos de hoy”
+      }
       await convRef.set(baseConv, { merge: true });
 
       // marca inbound “ahora” (además de lastMessageAt)
@@ -237,7 +241,7 @@ export default async function handler(req, res) {
           const parts = [name, phone].filter(Boolean);
           messageData.text = parts.length ? `📇 Contacto: ${parts.join(" · ")}` : "📇 Contacto";
         }
-          messageData.textPreview = messageData.text;
+        messageData.textPreview = messageData.text;
       }
 
       // === IMAGEN ===
