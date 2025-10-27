@@ -202,6 +202,16 @@ export default async function handler(req, res) {
       }
       await convRef.set(baseConv, { merge: true });
 
+      // ✅ OPT-IN: marcar consentimiento al recibir un inbound
+      await convRef.set(
+        { optIn: true, optInAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      await contactRef.set(
+        { optIn: true, optInAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+
       // marca inbound “ahora” (además de lastMessageAt)
       await convRef.set(
         {
