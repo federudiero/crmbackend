@@ -12,14 +12,25 @@ const EMAIL_TO_ENV = {
 // Limpia número a solo dígitos (Meta no quiere '+')
 const digits = (s) => String(s || "").replace(/\D+/g, "");
 
-// Sanea variables (sin \n/\t y sin 5+ espacios)
+// Sanea variables (preservando \n para que cada combo vaya en su propio renglón)
 function sanitizeParamServer(input) {
-  if (input === "\u200B") return input;
+  if (input === "\u200B") return input; // ZWSP permitido por Meta para “vacío”
   let x = String(input ?? "");
-  x = x.replace(/[\r\n\t]+/g, " • ");
+
+  // Antes: /[\r\n\t]+/g → " • "
+  // Ahora: preservamos \n, pero limpiamos \r y \t
+  x = x.replace(/[\r\t]+/g, " ");
+
+  // Colapsamos saltos de línea excesivos (3+ → 2)
+  x = x.replace(/\n{3,}/g, "\n\n");
+
+  // Espacios múltiples
   x = x.replace(/\s{2,}/g, " ");
   x = x.replace(/ {5,}/g, "    ");
+
   x = x.trim();
+
+  // Límite de seguridad de longitud por parámetro
   const MAX_PARAM_LEN = 1000;
   if (x.length > MAX_PARAM_LEN) x = x.slice(0, MAX_PARAM_LEN - 1) + "…";
   return x;
@@ -75,7 +86,7 @@ export default async function handler(req, res) {
     const { phone, components = [] } = input || {};
     if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-    // NORMALIZACIÓN DE COMPONENTES (evita #132018)
+    // NORMALIZACIÓN DE COMPONENTES (evita #132018) + preserva \n en params
     const fixedComponents = (components || []).map((c) => ({
       type: String(c?.type || "body").toLowerCase(),
       parameters: (c?.parameters || []).map((p) => ({
@@ -112,7 +123,7 @@ export default async function handler(req, res) {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // NUEVO: guardar el mensaje saliente en Firestore para que el CRM lo vea
+    // Guardar el mensaje saliente en Firestore para que el CRM lo vea
     // ─────────────────────────────────────────────────────────────
     try {
       const msgId = data?.messages?.[0]?.id || data?.message_id || null;
@@ -126,7 +137,7 @@ export default async function handler(req, res) {
       const ps = bodyComp?.parameters || [];
       const p1 = ps[0]?.text || ""; // saludo/nombre (puede venir vacío)
       const p2 = ps[1]?.text || ""; // vendedor
-      const p3 = ps[2]?.text || ""; // promos (texto largo)
+      // p3 = promos (texto largo). No lo metemos entero en preview para no alargar la lista
       const textPreview =
         (p1 && p2) ? `Hola ${p1}, soy ${p2}.` :
         (p2 ? `Soy ${p2}.` : "Plantilla enviada");
@@ -153,7 +164,7 @@ export default async function handler(req, res) {
           fromPhoneId: PHONE_ID,
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           status: "sent",
-          rawResponse: data, // opcional: útil para debug
+          rawResponse: data, // útil para debug
         }, { merge: true });
     } catch (e) {
       console.error("[OUT MSG SAVE] error:", e);
