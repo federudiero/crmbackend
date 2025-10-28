@@ -1,5 +1,5 @@
-// Envía SIEMPRE la plantilla promo_hogarcril_combos (es_AR).
-// Selecciona el PHONE_ID según el email del vendedor (Firebase Auth).
+// api/send-template.js
+// Envía SIEMPRE la plantilla promo_hogarcril_combos (es_AR) y normaliza components
 import { getFirestore } from "firebase-admin/firestore";
 import admin from "../lib/firebaseAdmin.js";
 
@@ -11,6 +11,7 @@ const EMAIL_TO_ENV = {
 
 export default async function handler(req, res) {
   try {
+    // ── CORS mínimo
     const ORIGIN = process.env.ALLOWED_ORIGIN || "https://crmhogarcril.com";
     res.setHeader("Access-Control-Allow-Origin", ORIGIN);
     res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -18,16 +19,16 @@ export default async function handler(req, res) {
     if (req.method === "OPTIONS") return res.status(204).end();
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-    // Auth: Firebase ID token
+    // ── Auth Firebase
     const auth = req.headers.authorization || "";
     const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing Bearer token" });
 
-    let decoded; 
+    let decoded;
     try { decoded = await admin.auth().verifyIdToken(idToken); }
     catch { return res.status(401).json({ error: "Invalid token" }); }
 
-    // Resolver PHONE_ID (doc sellers/{uid} o por email)
+    // ── Resolver PHONE_ID por seller
     const db = getFirestore();
     const uid = decoded.uid;
     const email = (decoded.email || "").toLowerCase();
@@ -51,12 +52,23 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: `Missing PHONE_ID (${phoneEnvKey}) or META_WA_TOKEN` });
     }
 
-    // Body
-    const payloadIn = await readJson(req);
-    const { phone, components = [] } = payloadIn || {};
+    // ── Body
+    const chunks = []; for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString("utf8");
+    const input = raw ? JSON.parse(raw) : {};
+    const { phone, components = [] } = input || {};
     if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-    // Payload bloqueado
+    // ── NORMALIZACIÓN CRÍTICA (evita #132018)
+    const fixedComponents = (components || []).map((c) => ({
+      // Meta espera "body" en minúsculas
+      type: String(c?.type || "body").toLowerCase(),
+      parameters: (c?.parameters || []).map((p) => ({
+        type: "text",
+        text: String(p?.text ?? "").trim(),
+      })),
+    }));
+
     const payload = {
       messaging_product: "whatsapp",
       to: phone,
@@ -64,29 +76,37 @@ export default async function handler(req, res) {
       template: {
         name: "promo_hogarcril_combos",
         language: { code: "es_AR" },
-        components,
+        components: fixedComponents,
       },
     };
 
-    // Envío
-    const r = await fetch(`https://graph.facebook.com/v21.0/${PHONE_ID}/messages`, {
+    // ── Envío a Graph
+    const url = `https://graph.facebook.com/v21.0/${PHONE_ID}/messages`;
+    const upstream = await fetch(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
-    const txt = await r.text(); 
-    let data; try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
-    if (!r.ok) return res.status(r.status).json({ error: data?.error || data });
+    const txt = await upstream.text();
+    let data; try { data = txt ? JSON.parse(txt) : {}; } catch { data = { raw: txt }; }
 
-    return res.status(200).json({ ok: true, data, from_phone_id: PHONE_ID, seller_uid: uid, seller_email: email, phoneEnvKey });
+    if (!upstream.ok) {
+      // Log útil para depurar si hubiera otro 400
+      console.error("[WA ERROR]", JSON.stringify({ payload, data }, null, 2));
+      return res.status(400).json({ error: data?.error || data });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      data,
+      from_phone_id: PHONE_ID,
+      seller_uid: uid,
+      seller_email: email,
+      phoneEnvKey,
+    });
   } catch (err) {
+    console.error("send-template fatal:", err);
     return res.status(500).json({ error: String(err?.message || err) });
   }
-}
-
-async function readJson(req) {
-  const chunks = []; for await (const c of req) chunks.push(c);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? JSON.parse(raw) : {};
 }
