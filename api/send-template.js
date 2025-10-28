@@ -111,6 +111,56 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: data?.error || data });
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // NUEVO: guardar el mensaje saliente en Firestore para que el CRM lo vea
+    // ─────────────────────────────────────────────────────────────
+    try {
+      const msgId = data?.messages?.[0]?.id || data?.message_id || null;
+
+      // convId en E.164 con "+" (lo que usa tu UI)
+      const onlyDigits = digits(phone);
+      const convId = String(phone).startsWith("+") ? String(phone) : `+${onlyDigits}`;
+
+      // preview cortita usando los parámetros de BODY ({{1}}, {{2}}, {{3}})
+      const bodyComp = fixedComponents.find(c => c.type === "body");
+      const ps = bodyComp?.parameters || [];
+      const p1 = ps[0]?.text || ""; // saludo/nombre (puede venir vacío)
+      const p2 = ps[1]?.text || ""; // vendedor
+      const p3 = ps[2]?.text || ""; // promos (texto largo)
+      const textPreview =
+        (p1 && p2) ? `Hola ${p1}, soy ${p2}.` :
+        (p2 ? `Soy ${p2}.` : "Plantilla enviada");
+
+      // asegurar conversación y actualizar lastMessageAt
+      await db.collection("conversations").doc(convId).set({
+        contactId: convId,
+        lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      // guardar mensaje
+      await db.collection("conversations").doc(convId)
+        .collection("messages")
+        .doc(msgId || db.collection("_").doc().id)
+        .set({
+          direction: "out",
+          type: "template",
+          template: {
+            name: "promo_hogarcril_combos",
+            language: "es_AR",
+            components: fixedComponents,
+          },
+          textPreview,
+          fromPhoneId: PHONE_ID,
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          status: "sent",
+          rawResponse: data, // opcional: útil para debug
+        }, { merge: true });
+    } catch (e) {
+      console.error("[OUT MSG SAVE] error:", e);
+      // no rompemos la respuesta al cliente si el guardado falla
+    }
+    // ─────────────────────────────────────────────────────────────
+
     return res.status(200).json({
       ok: true,
       data,
