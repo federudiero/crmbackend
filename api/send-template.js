@@ -1,5 +1,5 @@
 // api/send-template.js
-// Envía SIEMPRE la plantilla promo_hogarcril_combos (es_AR) y normaliza components
+// Envía SIEMPRE la plantilla promo_hogarcril_combos (es_AR) y normaliza components + número
 import { getFirestore } from "firebase-admin/firestore";
 import admin from "../lib/firebaseAdmin.js";
 
@@ -8,6 +8,22 @@ const EMAIL_TO_ENV = {
   "julicisneros.89@gmail.com": "META_WA_PHONE_ID_8148",
   "lunacami00@gmail.com": "META_WA_PHONE_ID",
 };
+
+// Limpia número a solo dígitos (Meta no quiere '+')
+const digits = (s) => String(s || "").replace(/\D+/g, "");
+
+// Sanea variables (sin \n/\t y sin 5+ espacios)
+function sanitizeParamServer(input) {
+  if (input === "\u200B") return input;
+  let x = String(input ?? "");
+  x = x.replace(/[\r\n\t]+/g, " • ");
+  x = x.replace(/\s{2,}/g, " ");
+  x = x.replace(/ {5,}/g, "    ");
+  x = x.trim();
+  const MAX_PARAM_LEN = 1000;
+  if (x.length > MAX_PARAM_LEN) x = x.slice(0, MAX_PARAM_LEN - 1) + "…";
+  return x;
+}
 
 export default async function handler(req, res) {
   try {
@@ -20,8 +36,8 @@ export default async function handler(req, res) {
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
     // ── Auth Firebase
-    const auth = req.headers.authorization || "";
-    const idToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+    const authH = req.headers.authorization || "";
+    const idToken = authH.startsWith("Bearer ") ? authH.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing Bearer token" });
 
     let decoded;
@@ -59,19 +75,18 @@ export default async function handler(req, res) {
     const { phone, components = [] } = input || {};
     if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-    // ── NORMALIZACIÓN CRÍTICA (evita #132018)
+    // NORMALIZACIÓN DE COMPONENTES (evita #132018)
     const fixedComponents = (components || []).map((c) => ({
-      // Meta espera "body" en minúsculas
       type: String(c?.type || "body").toLowerCase(),
       parameters: (c?.parameters || []).map((p) => ({
         type: "text",
-        text: String(p?.text ?? "").trim(),
+        text: sanitizeParamServer(p?.text),
       })),
     }));
 
     const payload = {
       messaging_product: "whatsapp",
-      to: phone,
+      to: digits(phone), // ← sin '+'
       type: "template",
       template: {
         name: "promo_hogarcril_combos",
@@ -92,7 +107,6 @@ export default async function handler(req, res) {
     let data; try { data = txt ? JSON.parse(txt) : {}; } catch { data = { raw: txt }; }
 
     if (!upstream.ok) {
-      // Log útil para depurar si hubiera otro 400
       console.error("[WA ERROR]", JSON.stringify({ payload, data }, null, 2));
       return res.status(400).json({ error: data?.error || data });
     }
