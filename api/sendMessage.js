@@ -90,15 +90,26 @@ function buildPreviewForSent({ sentType, text, template, image, audio, document 
     return typeof text === "string" ? text : (text?.body || "");
   }
   if (sentType === "template") {
-    // si el front armó el objeto, intentar una vista previa legible
+    // Vista previa legible, pero SOLO usa el texto de +24h si el nombre coincide
     try {
       const comps = Array.isArray(template?.components) ? template.components : [];
       const params = comps?.[0]?.parameters || [];
       const p = (i) => (typeof params[i]?.text === "string" ? params[i].text : "");
-      const p1 = p(0) || "¡Hola!";
-      const p2 = p(1) || "Equipo de Ventas";
-      const p3 = p(2) || "Tu Comercio";
-      return `¡Hola ${p1}! Soy ${p2} de ${p3}.`;
+
+      const name = String(template?.name || "").toLowerCase();
+      const envReengage = (process.env.VITE_WA_REENGAGE_TEMPLATE || "reengage_free_text").toLowerCase();
+      const isReengage = name === envReengage || name === "reengage_free_text";
+
+      if (isReengage) {
+        const p1 = p(0) || "¡Hola!";
+        const p2 = p(1) || "Equipo de Ventas";
+        const p3 = p(2) || "Tu Comercio";
+        return `¡Hola ${p1}! Soy ${p2} de ${p3}.`;
+      }
+
+      // Genérico para cualquier otra plantilla (ej. promo_hogarcril_combos)
+      const parts = params.map(x => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
+      return parts.length ? `[Plantilla ${template?.name}] ${parts.join(" • ")}` : `[Plantilla ${template?.name}]`;
     } catch {
       return `[Plantilla ${template?.name || "enviada"}]`;
     }
@@ -211,7 +222,7 @@ export default async function handler(req, res) {
         msgDoc.text = typeof text === "string" ? text : (text?.body || "");
       }
 
-      // === Nuevo: guardar template como objeto + textPreview ===
+      // === Guardar template como objeto + textPreview (condicionado por nombre) ===
       if (sentType === "template") {
         // Guardamos el objeto completo (para que el front lo pueda renderizar)
         msgDoc.template = {
@@ -220,20 +231,31 @@ export default async function handler(req, res) {
           components: Array.isArray(template?.components) ? template.components : [],
         };
 
-        // textPreview legible (HSM de reengagement con 3 variables)
+        // textPreview: SOLO usa el copy de +24h si el nombre es el de reengage
         try {
+          const name = String(msgDoc?.template?.name || "").toLowerCase();
+          const envReengage = (process.env.VITE_WA_REENGAGE_TEMPLATE || "reengage_free_text").toLowerCase();
+          const isReengage = name === envReengage || name === "reengage_free_text";
+
           const comps = msgDoc.template.components?.[0]?.parameters || [];
           const p = (i) => (typeof comps[i]?.text === "string" ? comps[i].text : "");
-          const p1 = p(0) || "¡Hola!";
-          const p2 = p(1) || "Equipo de Ventas";
-          const p3 = p(2) || "Tu Comercio";
-          msgDoc.textPreview =
-            `¡Hola ${p1}! Soy ${p2} de ${p3}.\n` +
-            `Te escribo para retomar tu consulta ya que pasaron más de 24 horas desde el último mensaje.\n` +
-            `Respondé a este mensaje para continuar la conversación.`;
+
+          if (isReengage) {
+            const p1 = p(0) || "¡Hola!";
+            const p2 = p(1) || "Equipo de Ventas";
+            const p3 = p(2) || "Tu Comercio";
+            msgDoc.textPreview =
+              `¡Hola ${p1}! Soy ${p2} de ${p3}.\n` +
+              `Te escribo para retomar tu consulta ya que pasaron más de 24 horas desde el último mensaje.\n` +
+              `Respondé a este mensaje para continuar la conversación.`;
+          } else {
+            const parts = comps.map(x => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
+            const label = msgDoc?.template?.name || "template";
+            msgDoc.textPreview = parts.length ? `[Plantilla ${label}] ${parts.join(" • ")}` : `[Plantilla ${label}]`;
+          }
         } catch {
-          const name = msgDoc?.template?.name || "template";
-          msgDoc.textPreview = `[Plantilla ${name}]`;
+          const label = msgDoc?.template?.name || "template";
+          msgDoc.textPreview = `[Plantilla ${label}]`;
         }
       }
 
@@ -288,7 +310,7 @@ export default async function handler(req, res) {
       // === Guardar mensaje ===
       await convRef.collection("messages").doc(wamid).set(msgDoc, { merge: true });
 
-      // === 👇 NUEVO: actualizar meta de conversación (preview) ===
+      // === Actualizar meta de conversación (preview consistente) ===
       const preview = buildPreviewForSent({
         sentType,
         text,
