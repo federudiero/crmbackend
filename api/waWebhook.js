@@ -1,6 +1,6 @@
 // api/waWebhook.js — webhook WhatsApp con media entrante robusto + replyTo en entrantes + EMAIL AL VENDEDOR
 import { db, FieldValue, bucket } from "../lib/firebaseAdmin.js";
-import { sendEmail } from "../lib/email.js"; // 👈 NUEVO: helper de email
+import { sendEmail } from "../lib/email.js"; // 👈 helper de email
 
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -45,6 +45,7 @@ function extractTextFromMessage(m) {
     m.button?.text ||
     m.image?.caption ||
     m.document?.caption ||
+    m.video?.caption ||           // 👈 incluir caption de video si viene
     ""
   );
 }
@@ -195,14 +196,14 @@ export default async function handler(req, res) {
         lastInboundPhoneId: phoneId,
         lastInboundDisplay: phoneDisplay,
       };
-      // 👇 ÚNICO cambio de lógica: además de createdAt, guardamos firstInboundAt la PRIMERA VEZ
+      // 👇 además de createdAt, guardamos firstInboundAt la PRIMERA VEZ
       if (!convSnap.exists) {
         baseConv.createdAt = FieldValue.serverTimestamp();
-        baseConv.firstInboundAt = FieldValue.serverTimestamp(); // 👈 clave para “Nuevos de hoy”
+        baseConv.firstInboundAt = FieldValue.serverTimestamp();
       }
       await convRef.set(baseConv, { merge: true });
 
-      // ✅ OPT-IN: marcar consentimiento al recibir un inbound
+      // ✅ OPT-IN al recibir un inbound
       await convRef.set(
         { optIn: true, optInAt: FieldValue.serverTimestamp() },
         { merge: true }
@@ -212,7 +213,7 @@ export default async function handler(req, res) {
         { merge: true }
       );
 
-      // marca inbound “ahora” (además de lastMessageAt)
+      // marca inbound “ahora”
       await convRef.set(
         {
           lastInboundAt: FieldValue.serverTimestamp(),
@@ -223,7 +224,7 @@ export default async function handler(req, res) {
 
       // message base
       const messageData = {
-        direction: "in", // tu lógica usa "in" para entrantes
+        direction: "in",
         type: m.type || "text",
         text,
         timestamp: new Date(tsSec * 1000),
@@ -243,10 +244,8 @@ export default async function handler(req, res) {
         const ph = c?.phones?.[0]?.wa_id || c?.phones?.[0]?.phone || c?.phones?.[0]?.value || "";
         const phone = ph ? `+${digits(ph)}` : null;
 
-        // Enriquecer messageData con objeto contacto (opcional)
         messageData.contact = stripUndefined({ name, phone, raw: c });
 
-        // Si el texto quedó vacío, completar con string legible
         if (!messageData.text || messageData.text.trim() === "") {
           const parts = [name, phone].filter(Boolean);
           messageData.text = parts.length ? `📇 Contacto: ${parts.join(" · ")}` : "📇 Contacto";
@@ -293,7 +292,7 @@ export default async function handler(req, res) {
         }
       }
 
-      // === AUDIO ===
+      // === AUDIO (mejorado: url, mime, duration, voice) ===
       if (m.type === "audio") {
         const audId   = m.audio?.id || null;
         const audLink = m.audio?.link || null;
@@ -307,10 +306,13 @@ export default async function handler(req, res) {
         const media = {
           kind: "audio",
           ...(Boolean(m.audio?.voice) ? { voice: true } : {}),
+          ...(Number.isFinite(m.audio?.duration) ? { duration: Number(m.audio.duration) } : {}),
+          ...(m.audio?.mime_type ? { mime: m.audio.mime_type } : {}),
           ...(saved?.path ? { path: saved.path } : {}),
           ...((saved?.url || audLink) ? { url: saved?.url || audLink } : {}),
         };
         messageData.media = Object.keys(media).length ? media : { kind: "audio" };
+        if (media.url) messageData.mediaUrl = media.url;
       }
 
       // === DOCUMENT ===
@@ -353,6 +355,30 @@ export default async function handler(req, res) {
         }
       }
 
+      // === VIDEO (nuevo, simétrico a imagen/documento) ===
+      if (m.type === "video") {
+        const vidId   = m.video?.id || null;
+        const vidLink = m.video?.link || null;
+        let saved = null;
+        if (vidId) {
+          try {
+            const file = await fetchMedia(vidId);     // helper existente
+            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+          } catch (e) { console.error("video error:", e); }
+        }
+        const media = {
+          kind: "video",
+          ...(m.video?.filename ? { filename: m.video.filename } : {}),
+          ...(m.video?.mime_type ? { mime: m.video.mime_type } : {}),
+          ...(Number.isFinite(m.video?.duration) ? { duration: Number(m.video.duration) } : {}),
+          ...(saved?.path ? { path: saved.path } : {}),
+          ...((saved?.url || vidLink) ? { url: saved?.url || vidLink } : {}),
+        };
+        messageData.media = Object.keys(media).length ? media : { kind: "video" };
+        if (media.url) messageData.mediaUrl = media.url;
+        // mantener caption como text si existía (extractTextFromMessage ya lo contempla)
+      }
+
       // === LOCATION ===
       if (m.type === "location") {
         const lat = Number(m?.location?.latitude);
@@ -390,6 +416,16 @@ export default async function handler(req, res) {
           ...(saved?.url ? { url: saved.url } : {}),
         };
         messageData.media = Object.keys(media).length ? media : { kind: "sticker" };
+      }
+
+      // === REACTION (nuevo) ===
+      if (m.type === "reaction") {
+        messageData.type = "reaction";
+        messageData.reaction = {
+          emoji: m.reaction?.emoji || null,
+          toMessageId: m.reaction?.message_id || null,
+        };
+        messageData.textPreview = `❤️ reacción: ${m.reaction?.emoji || ""}`.trim();
       }
 
       // === reply del CLIENTE (context.message_id → replyTo) ===
