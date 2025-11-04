@@ -17,8 +17,7 @@ function sanitizeParamServer(input) {
   if (input === "\u200B") return input; // ZWSP permitido por Meta para “vacío”
   let x = String(input ?? "");
 
-  // Antes: /[\r\n\t]+/g → " • "
-  // Ahora: preservamos \n, pero limpiamos \r y \t
+  // preservamos \n, pero limpiamos \r y \t
   x = x.replace(/[\r\t]+/g, " ");
 
   // Colapsamos saltos de línea excesivos (3+ → 2)
@@ -86,15 +85,60 @@ export default async function handler(req, res) {
     const { phone, components = [] } = input || {};
     if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-    // NORMALIZACIÓN DE COMPONENTES (evita #132018) + preserva \n en params
-    const fixedComponents = (components || []).map((c) => ({
-      type: String(c?.type || "body").toLowerCase(),
-      parameters: (c?.parameters || []).map((p) => ({
-        type: "text",
-        text: sanitizeParamServer(p?.text),
-      })),
-    }));
+    // ====== Fallback robusto para evitar #132018 ======
 
+    // helper para tomar la 1ª clave que venga con string no vacío
+    const pick = (...keys) => {
+      for (const k of keys) {
+        const v = typeof input?.[k] === "string" ? input[k] : null;
+        if (v && v.trim() !== "") return v;
+      }
+      return null;
+    };
+
+    // Variables sueltas aceptadas (fallback)
+    const v1 = sanitizeParamServer(pick("v1","var1","body1","saludo","nombre","name") || "\u200B");
+    const v2 = sanitizeParamServer(pick("v2","var2","body2","vendedor","seller") || "\u200B");
+    const v3 = sanitizeParamServer(pick("v3","var3","body3","promos","texto","lista","body") || "\u200B");
+
+    // Si el front envía components, los normalizamos; si no, armamos body con v1,v2,v3
+    let fixedComponents;
+    if (Array.isArray(components) && components.length) {
+      const norm = (components || []).map((c) => ({
+        type: String(c?.type || "body").toLowerCase(),
+        parameters: (c?.parameters || []).map((p) => ({
+          type: "text",
+          text: sanitizeParamServer(p?.text),
+        })),
+      }));
+      const bodyComp = norm.find(c => c.type === "body");
+      const params = (bodyComp?.parameters || []);
+      // forzamos exactamente 3 params; si faltan, completamos con v1,v2,v3
+      const p0 = params[0]?.text ?? v1;
+      const p1 = params[1]?.text ?? v2;
+      const p2 = params[2]?.text ?? v3;
+      fixedComponents = [{ type: "body", parameters: [
+        { type:"text", text: sanitizeParamServer(p0) },
+        { type:"text", text: sanitizeParamServer(p1) },
+        { type:"text", text: sanitizeParamServer(p2) },
+      ] }];
+    } else {
+      fixedComponents = [{
+        type: "body",
+        parameters: [
+          { type:"text", text: v1 },
+          { type:"text", text: v2 },
+          { type:"text", text: v3 },
+        ],
+      }];
+    }
+
+    // log de depuración (podés quitarlo luego)
+    try {
+      console.log("WA template body params =>", fixedComponents[0]?.parameters?.map(p => p.text));
+    } catch {}
+
+    // ====== Payload ======
     const payload = {
       messaging_product: "whatsapp",
       to: digits(phone), // ← sin '+'
