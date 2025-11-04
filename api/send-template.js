@@ -12,28 +12,30 @@ const EMAIL_TO_ENV = {
 // Limpia número a solo dígitos (Meta no quiere '+')
 const digits = (s) => String(s || "").replace(/\D+/g, "");
 
-// Sanea variables (preservando \n para que cada combo vaya en su propio renglón)
+// Sanea variables para cumplir reglas de Meta (SIN \n/\t y sin 5+ espacios)
+// - Reemplaza \n por " • " (una sola línea)
+// - Quita \r y \t
 function sanitizeParamServer(input) {
-  if (input === "\u200B") return input; // ZWSP permitido por Meta para “vacío”
+  if (input === "\u200B") return input; // ZWSP permitido
   let x = String(input ?? "");
 
-  // preservamos \n, pero limpiamos \r y \t
+  // quitar \r y \t
   x = x.replace(/[\r\t]+/g, " ");
 
-  // Colapsamos saltos de línea excesivos (3+ → 2)
-  x = x.replace(/\n{3,}/g, "\n\n");
+  // NUEVO: convertir \n a separadores
+  x = x.replace(/\n+/g, " • ");
 
-  // Espacios múltiples
+  // colapsar espacios y evitar 5+ consecutivos
   x = x.replace(/\s{2,}/g, " ");
   x = x.replace(/ {5,}/g, "    ");
 
   x = x.trim();
 
-  // Límite de seguridad de longitud por parámetro
   const MAX_PARAM_LEN = 1000;
   if (x.length > MAX_PARAM_LEN) x = x.slice(0, MAX_PARAM_LEN - 1) + "…";
   return x;
 }
+
 
 export default async function handler(req, res) {
   try {
