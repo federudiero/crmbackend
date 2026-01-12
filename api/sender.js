@@ -6,6 +6,7 @@ const EMAIL_TO_ENV = {
   "christian15366@gmail.com": "META_WA_PHONE_ID_0453",
   "julicisneros.89@gmail.com": "META_WA_PHONE_ID_8148",
   "lunacami00@gmail.com": "META_WA_PHONE_ID",
+  "escalantefr.p@gmail.com": "META_WA_PHONE_ID_VM"
 };
 
 export default async function handler(req, res) {

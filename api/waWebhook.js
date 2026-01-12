@@ -66,6 +66,33 @@ function stripUndefined(obj) {
 const GRAPH   = "https://graph.facebook.com/v23.0";
 const WA_TOKEN = process.env.META_WA_TOKEN;
 
+/** --- NUEVO: Helper de ruteo automático por área (Villa María y otras) --- */
+function pickAreaAssignee({ e164, display }) {
+  const s = String(e164 || display || "");
+  const raw = process.env.AREA_ROUTING_JSON || "";
+  let map = {};
+  try { map = JSON.parse(raw); } catch {}
+  // Ajustable: por defecto solo ruteamos números AR (+549...)
+  if (!s.startsWith("+549")) return null;
+
+  // Probar prefijos configurados y elegir el más largo que matchee (353, 3573, etc.)
+  const candidates = [];
+  for (const k of Object.keys(map || {})) {
+    if (s.startsWith("+549" + String(k))) candidates.push(k);
+  }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.length - a.length);
+  const best = candidates[0];
+  const out = map[best];
+  if (!out || !out.uid) return null;
+  return {
+    uid: out.uid,
+    email: out.email || null,
+    name: out.name || out.email || null,
+    area: best,
+  };
+}
+
 /** Descarga metadata + binario del media de WhatsApp (con reintentos rápidos) */
 async function fetchMedia(mediaId, retryCount = 0) {
   const MAX_RETRIES = 2;
@@ -202,6 +229,32 @@ export default async function handler(req, res) {
         baseConv.firstInboundAt = FieldValue.serverTimestamp();
       }
       await convRef.set(baseConv, { merge: true });
+
+      /** 🔹 NUEVO BLOQUE: auto-asignación por área (solo si no tiene dueño) */
+      try {
+        const snapBeforeAssign = await convRef.get();
+        const hasOwner = !!snapBeforeAssign.get("assignedToUid");
+        if (!hasOwner) {
+          const route = pickAreaAssignee({
+            e164: convId,                  // "+549..."
+            display: phoneDisplay || null, // "549351..." etc.
+          });
+          if (route?.uid) {
+            const assignPayload = {
+              assignedToUid: route.uid,
+              ...(route.name ? { assignedToName: route.name } : {}),
+              ...(route.email ? { assignedToEmail: route.email } : {}),
+              assignedAt: FieldValue.serverTimestamp(),
+            };
+            await convRef.set(assignPayload, { merge: true });
+            // (Opcional) etiqueta para debug/segmentación:
+            // await convRef.set({ labels: FieldValue.arrayUnion("zonas") }, { merge: true });
+            console.log("Auto-asignada por área", { convId, area: route.area, to: route.uid });
+          }
+        }
+      } catch (e) {
+        console.error("Auto-assign error:", e);
+      }
 
       // ✅ OPT-IN al recibir un inbound
       await convRef.set(
