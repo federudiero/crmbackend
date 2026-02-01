@@ -1,6 +1,5 @@
-// /api/templates.js
-// Devuelve SOLO la plantilla promo_hogarcril_combos (es_AR) si está APPROVED/MARKETING.
-
+// api/templates.js
+// Devuelve plantillas aprobadas en es_AR (promo + remarketing)
 function setCors(req, res) {
   const ALLOWED = (process.env.ALLOWED_ORIGIN || "https://crmhogarcril.com,http://localhost:5174")
     .split(",")
@@ -11,10 +10,15 @@ function setCors(req, res) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
+
+const ALLOWED_TEMPLATE_NAMES = new Set([
+  "promo_hogarcril_combos",
+  "reengage_free_text",
+]);
 
 export default async function handler(req, res) {
   setCors(req, res);
@@ -32,7 +36,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing META_WA_TOKEN or WABA ID" });
     }
 
-    let url = `https://graph.facebook.com/v21.0/${WABA_ID}/message_templates?limit=100`;
+    let url = `https://graph.facebook.com/v23.0/${WABA_ID}/message_templates?limit=100`;
     const all = [];
 
     while (url) {
@@ -40,12 +44,9 @@ export default async function handler(req, res) {
       const txt = await r.text();
 
       let data;
-      try {
-        data = JSON.parse(txt);
-      } catch {
-        return res
-          .status(r.status || 500)
-          .json({ error: "Upstream not JSON", raw: txt?.slice(0, 200) });
+      try { data = JSON.parse(txt); }
+      catch {
+        return res.status(r.status || 500).json({ error: "Upstream not JSON", raw: txt?.slice(0, 200) });
       }
 
       if (!r.ok) return res.status(r.status).json({ error: data?.error || data });
@@ -56,9 +57,9 @@ export default async function handler(req, res) {
     const mapped = all.map((t) => {
       const body = (t?.components || []).find((c) => c.type === "BODY");
       const text = body?.text || "";
-      const nums = [...new Set([...text.matchAll(/\{\{(\d+)\}\}/g)].map((m) => parseInt(m[1], 10)))].sort(
-        (a, b) => a - b
-      );
+      const nums = [...new Set([...text.matchAll(/\{\{(\d+)\}\}/g)].map((m) => parseInt(m[1], 10)))]
+        .sort((a, b) => a - b);
+
       return {
         name: t.name,
         status: t.status,
@@ -69,13 +70,15 @@ export default async function handler(req, res) {
       };
     });
 
-    const filtered = mapped.filter(
-      (t) =>
-        t.name === "promo_hogarcril_combos" &&
-        (t.language === "es_AR" || t.language?.code === "es_AR") &&
-        String(t.status).toUpperCase() === "APPROVED" &&
-        String(t.category).toUpperCase() === "MARKETING"
-    );
+    // ✅ devolvemos las que te interesan (es_AR) y que estén aprobadas o activas
+    const filtered = mapped.filter((t) => {
+      const nameOk = ALLOWED_TEMPLATE_NAMES.has(String(t.name || "").trim());
+      const langOk = String(t.language || "").toLowerCase() === "es_ar";
+      const status = String(t.status || "").toUpperCase();
+      const statusOk = status === "APPROVED" || status === "PAUSED" || status === "IN_APPEAL" || status === "PENDING" || status === "REINSTATED";
+      // Nota: Meta suele usar APPROVED; dejamos otros por si UI muestra “activa/calidad pendiente”
+      return nameOk && langOk && statusOk;
+    });
 
     return res.status(200).json({ templates: filtered });
   } catch (err) {

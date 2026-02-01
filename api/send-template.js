@@ -1,7 +1,20 @@
 // api/send-template.js
-// Envía SIEMPRE la plantilla promo_hogarcril_combos (es_AR) y normaliza components + número
+// Envía plantillas WhatsApp (promo / remarketing) + guarda OUT en Firestore con convId canónico (+549...)
+// FIX: normaliza convId (AR 5415 -> 549) para que el CRM siempre vea los salientes
 import { getFirestore } from "firebase-admin/firestore";
 import admin from "../lib/firebaseAdmin.js";
+
+// ====== Config ======
+const GRAPH_BASE = "https://graph.facebook.com/v23.0";
+const PREFER_5415 = String(process.env.META_WA_PREFER_5415 || "") === "1";
+
+// templates permitidas
+const ALLOWED_TEMPLATES = new Set([
+  "promo_hogarcril_combos",
+  "reengage_free_text",
+]);
+
+const DEFAULT_TEMPLATE = "promo_hogarcril_combos";
 
 const EMAIL_TO_ENV = {
   "christian15366@gmail.com": "META_WA_PHONE_ID_0453",
@@ -9,26 +22,63 @@ const EMAIL_TO_ENV = {
   "lunacami00@gmail.com": "META_WA_PHONE_ID",
 };
 
-// Limpia número a solo dígitos (Meta no quiere '+')
+// ====== helpers números (AR) ======
 const digits = (s) => String(s || "").replace(/\D+/g, "");
 
-// Sanea variables para cumplir reglas de Meta (SIN \n/\t y sin 5+ espacios)
-// - Reemplaza \n por " • " (una sola línea)
-// - Quita \r y \t
+function normalizeE164AR(raw) {
+  let d = digits(raw);
+  if (!d) return "";
+  if (d.startsWith("549")) return `+${d}`;
+  const m5415 = d.match(/^54(\d{2,4})15(\d+)$/);
+  if (m5415) {
+    const [, area, local] = m5415;
+    return `+549${area}${local}`;
+  }
+  if (d.startsWith("54")) return `+${d}`;
+  if (d.startsWith("00")) d = d.slice(2);
+  d = d.replace(/^0+/, "");
+  return `+${d}`;
+}
+
+function candidatesForSendAR(toRaw) {
+  const d0 = digits(toRaw);
+
+  // Si ya viene 549..., probamos 549 y 5415
+  if (/^549\d+$/.test(d0)) {
+    const areaLocal = d0.slice(3);
+    const m = areaLocal.match(/^(\d{2,4})(\d+)$/);
+    if (!m) return [d0];
+    const [, area, rest] = m;
+    return PREFER_5415 ? [`54${area}15${rest}`, d0] : [d0, `54${area}15${rest}`];
+  }
+
+  // Si viene 5415..., probamos 549 y 5415
+  const m5415 = d0.match(/^54(\d{2,4})15(\d+)$/);
+  if (m5415) {
+    const [, area, rest] = m5415;
+    return PREFER_5415 ? [d0, `549${area}${rest}`] : [`549${area}${rest}`, d0];
+  }
+
+  // Fallback genérico: armar 549 y 5415 desde lo que haya
+  let d = d0;
+  if (d.startsWith("00")) d = d.slice(2);
+  d = d.replace(/^0+/, "");
+  const area = /^11\d{8}$/.test(d) ? d.slice(0, 2) : d.slice(0, 3);
+  const local = d.slice(area.length);
+  const v549 = `549${area}${local}`;
+  const v5415 = `54${area}15${local}`;
+  return PREFER_5415 ? [v5415, v549] : [v549, v5415];
+}
+
+// ====== sanitize (Meta) ======
 function sanitizeParamServer(input) {
   if (input === "\u200B") return input; // ZWSP permitido
   let x = String(input ?? "");
 
-  // quitar \r y \t
   x = x.replace(/[\r\t]+/g, " ");
-
-  // NUEVO: convertir \n a separadores
   x = x.replace(/\n+/g, " • ");
-
-  // colapsar espacios y evitar 5+ consecutivos
   x = x.replace(/\s{2,}/g, " ");
   x = x.replace(/ {5,}/g, "    ");
-
   x = x.trim();
 
   const MAX_PARAM_LEN = 1000;
@@ -36,14 +86,18 @@ function sanitizeParamServer(input) {
   return x;
 }
 
+// ====== cors ======
+function setCors(req, res) {
+  const ORIGIN = process.env.ALLOWED_ORIGIN || "https://crmhogarcril.com";
+  res.setHeader("Access-Control-Allow-Origin", ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+}
 
+// ====== main ======
 export default async function handler(req, res) {
   try {
-    // ── CORS mínimo
-    const ORIGIN = process.env.ALLOWED_ORIGIN || "https://crmhogarcril.com";
-    res.setHeader("Access-Control-Allow-Origin", ORIGIN);
-    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+    setCors(req, res);
     if (req.method === "OPTIONS") return res.status(204).end();
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -56,16 +110,16 @@ export default async function handler(req, res) {
     try { decoded = await admin.auth().verifyIdToken(idToken); }
     catch { return res.status(401).json({ error: "Invalid token" }); }
 
-    // ── Resolver PHONE_ID por seller
     const db = getFirestore();
     const uid = decoded.uid;
     const email = (decoded.email || "").toLowerCase();
 
+    // ── Resolver PHONE_ID por seller
     let phoneEnvKey = null;
     try {
       const doc = await db.collection("sellers").doc(uid).get();
       if (doc.exists) phoneEnvKey = doc.data()?.phoneEnvKey || null;
-    } catch {}
+    } catch { }
 
     if (!phoneEnvKey && email) phoneEnvKey = EMAIL_TO_ENV[email] || "META_WA_PHONE_ID";
 
@@ -84,12 +138,24 @@ export default async function handler(req, res) {
     const chunks = []; for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString("utf8");
     const input = raw ? JSON.parse(raw) : {};
-    const { phone, components = [] } = input || {};
+
+    const {
+      phone,
+      components = [],
+      templateName,
+      name, // alias opcional
+      languageCode,
+    } = input || {};
+
     if (!phone) return res.status(400).json({ error: "Missing phone" });
 
-    // ====== Fallback robusto para evitar #132018 ======
+    // template a enviar
+    const requested = String(templateName || name || DEFAULT_TEMPLATE).trim();
+    const tName = ALLOWED_TEMPLATES.has(requested) ? requested : DEFAULT_TEMPLATE;
 
-    // helper para tomar la 1ª clave que venga con string no vacío
+    const lang = String(languageCode || "es_AR");
+
+    // ====== Fallback robusto para evitar #132018 ======
     const pick = (...keys) => {
       for (const k of keys) {
         const v = typeof input?.[k] === "string" ? input[k] : null;
@@ -98,12 +164,10 @@ export default async function handler(req, res) {
       return null;
     };
 
-    // Variables sueltas aceptadas (fallback)
-    const v1 = sanitizeParamServer(pick("v1","var1","body1","saludo","nombre","name") || "\u200B");
-    const v2 = sanitizeParamServer(pick("v2","var2","body2","vendedor","seller") || "\u200B");
-    const v3 = sanitizeParamServer(pick("v3","var3","body3","promos","texto","lista","body") || "\u200B");
+    const v1 = sanitizeParamServer(pick("v1", "var1", "body1", "saludo", "nombre", "name1") || "\u200B");
+    const v2 = sanitizeParamServer(pick("v2", "var2", "body2", "vendedor", "seller", "name2") || "\u200B");
+    const v3 = sanitizeParamServer(pick("v3", "var3", "body3", "promos", "texto", "lista", "body", "name3") || "\u200B");
 
-    // Si el front envía components, los normalizamos; si no, armamos body con v1,v2,v3
     let fixedComponents;
     if (Array.isArray(components) && components.length) {
       const norm = (components || []).map((c) => ({
@@ -115,112 +179,128 @@ export default async function handler(req, res) {
       }));
       const bodyComp = norm.find(c => c.type === "body");
       const params = (bodyComp?.parameters || []);
-      // forzamos exactamente 3 params; si faltan, completamos con v1,v2,v3
       const p0 = params[0]?.text ?? v1;
       const p1 = params[1]?.text ?? v2;
       const p2 = params[2]?.text ?? v3;
-      fixedComponents = [{ type: "body", parameters: [
-        { type:"text", text: sanitizeParamServer(p0) },
-        { type:"text", text: sanitizeParamServer(p1) },
-        { type:"text", text: sanitizeParamServer(p2) },
-      ] }];
+
+      fixedComponents = [{
+        type: "body",
+        parameters: [
+          { type: "text", text: sanitizeParamServer(p0) },
+          { type: "text", text: sanitizeParamServer(p1) },
+          { type: "text", text: sanitizeParamServer(p2) },
+        ]
+      }];
     } else {
       fixedComponents = [{
         type: "body",
         parameters: [
-          { type:"text", text: v1 },
-          { type:"text", text: v2 },
-          { type:"text", text: v3 },
+          { type: "text", text: v1 },
+          { type: "text", text: v2 },
+          { type: "text", text: v3 },
         ],
       }];
     }
 
-    // log de depuración (podés quitarlo luego)
-    try {
-      console.log("WA template body params =>", fixedComponents[0]?.parameters?.map(p => p.text));
-    } catch {}
+    // ====== Envío a Graph (probando 549/5415) ======
+    const cands = candidatesForSendAR(phone);
 
-    // ====== Payload ======
-    const payload = {
-      messaging_product: "whatsapp",
-      to: digits(phone), // ← sin '+'
-      type: "template",
-      template: {
-        name: "promo_hogarcril_combos",
-        language: { code: "es_AR" },
-        components: fixedComponents,
-      },
-    };
+    let upstreamOk = false;
+    let data = null;
+    let usedToDigits = null;
+    let lastErr = null;
 
-    // ── Envío a Graph
-    const url = `https://graph.facebook.com/v21.0/${PHONE_ID}/messages`;
-    const upstream = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    for (const cand of cands) {
+      const payload = {
+        messaging_product: "whatsapp",
+        to: cand, // dígitos sin '+'
+        type: "template",
+        template: {
+          name: tName,
+          language: { code: lang },
+          components: fixedComponents,
+        },
+      };
 
-    const txt = await upstream.text();
-    let data; try { data = txt ? JSON.parse(txt) : {}; } catch { data = { raw: txt }; }
+      const url = `${GRAPH_BASE}/${PHONE_ID}/messages`;
+      const upstream = await fetch(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
 
-    if (!upstream.ok) {
-      console.error("[WA ERROR]", JSON.stringify({ payload, data }, null, 2));
-      return res.status(400).json({ error: data?.error || data });
+      const txt = await upstream.text();
+      try { data = txt ? JSON.parse(txt) : {}; } catch { data = { raw: txt }; }
+
+      if (upstream.ok) {
+        upstreamOk = true;
+        usedToDigits = cand;
+        break;
+      }
+
+      lastErr = data;
+      // allow-list sandbox: 131030 (si lo tenés) => intentamos el otro candidato
+      if (data?.error?.code !== 131030) break;
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Guardar el mensaje saliente en Firestore para que el CRM lo vea
-    // ─────────────────────────────────────────────────────────────
+    if (!upstreamOk) {
+      console.error("[WA TEMPLATE ERROR]", JSON.stringify({ phone, cands, template: tName, data: lastErr }, null, 2));
+      return res.status(400).json({ error: lastErr?.error || lastErr });
+    }
+
+    // ====== Guardar OUT en Firestore en convId canónico ======
     try {
       const msgId = data?.messages?.[0]?.id || data?.message_id || null;
 
-      // convId en E.164 con "+" (lo que usa tu UI)
-      const onlyDigits = digits(phone);
-      const convId = String(phone).startsWith("+") ? String(phone) : `+${onlyDigits}`;
+      // FIX CLAVE: convId canónico +549...
+      const convId = normalizeE164AR(usedToDigits || phone);
 
-      // preview cortita usando los parámetros de BODY ({{1}}, {{2}}, {{3}})
       const bodyComp = fixedComponents.find(c => c.type === "body");
       const ps = bodyComp?.parameters || [];
-      const p1 = ps[0]?.text || ""; // saludo/nombre (puede venir vacío)
-      const p2 = ps[1]?.text || ""; // vendedor
-      // p3 = promos (texto largo). No lo metemos entero en preview para no alargar la lista
+      const p1 = ps[0]?.text || "";
+      const p2 = ps[1]?.text || "";
       const textPreview =
         (p1 && p2) ? `Hola ${p1}, soy ${p2}.` :
-        (p2 ? `Soy ${p2}.` : "Plantilla enviada");
+          (p2 ? `Soy ${p2}.` : `[Plantilla ${tName}]`);
 
-      // asegurar conversación y actualizar lastMessageAt
-      await db.collection("conversations").doc(convId).set({
+      const convRef = db.collection("conversations").doc(convId);
+
+      await convRef.set({
         contactId: convId,
         lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastMessageDirection: "out",
+        lastMessageText: textPreview,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
 
-      // guardar mensaje
-      await db.collection("conversations").doc(convId)
-        .collection("messages")
+      await convRef.collection("messages")
         .doc(msgId || db.collection("_").doc().id)
         .set({
           direction: "out",
           type: "template",
           template: {
-            name: "promo_hogarcril_combos",
-            language: "es_AR",
+            name: tName,
+            language: lang,
             components: fixedComponents,
           },
           textPreview,
-          fromPhoneId: PHONE_ID,
+          businessPhoneId: PHONE_ID,          // ✅ mismo nombre que el resto del sistema
           timestamp: admin.firestore.FieldValue.serverTimestamp(),
           status: "sent",
-          rawResponse: data, // útil para debug
+          sendVariant: usedToDigits?.startsWith("549") ? "549" : "5415",
+          to: convId,
+          toRawSent: usedToDigits ? `+${usedToDigits}` : undefined,
+          rawResponse: data,
         }, { merge: true });
     } catch (e) {
       console.error("[OUT MSG SAVE] error:", e);
-      // no rompemos la respuesta al cliente si el guardado falla
+      // no rompemos la respuesta si el guardado falla
     }
-    // ─────────────────────────────────────────────────────────────
 
     return res.status(200).json({
       ok: true,
       data,
+      template: tName,
       from_phone_id: PHONE_ID,
       seller_uid: uid,
       seller_email: email,

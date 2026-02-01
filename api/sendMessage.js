@@ -2,7 +2,7 @@
 
 // ====== CORS ======
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*", // poné tu dominio en prod
+  "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*", // en prod poné tu dominio
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
@@ -10,7 +10,7 @@ const setCors = (res) => {
   for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
 };
 
-// ====== Constantes de Graph / env (leer env acá no rompe OPTIONS) ======
+// ====== Constantes ======
 const GRAPH_BASE = "https://graph.facebook.com/v23.0";
 const DEFAULT_PHONE_ID = process.env.META_WA_PHONE_ID || "";
 const TOKEN = process.env.META_WA_TOKEN || "";
@@ -24,7 +24,10 @@ function normalizeE164AR(raw) {
   if (!d) return "";
   if (d.startsWith("549")) return `+${d}`;
   const m5415 = d.match(/^54(\d{2,4})15(\d+)$/);
-  if (m5415) { const [, area, local] = m5415; return `+549${area}${local}`; }
+  if (m5415) {
+    const [, area, local] = m5415;
+    return `+549${area}${local}`;
+  }
   if (d.startsWith("54")) return `+${d}`;
   if (d.startsWith("00")) d = d.slice(2);
   d = d.replace(/^0+/, "");
@@ -72,14 +75,17 @@ async function sendToGraph(phoneId, toDigits, payload) {
 
 // ---------- resolver emisor ----------
 async function resolvePhoneIdFor(db, toRaw, explicitPhoneId, defaultPhoneId) {
-  if (explicitPhoneId) return explicitPhoneId; // front manda fromWaPhoneId/phoneId
+  if (explicitPhoneId) return explicitPhoneId;
+
   const convId = normalizeE164AR(toRaw);
   if (convId) {
     try {
       const snap = await db.collection("conversations").doc(convId).get();
       const fromConv = snap.exists ? snap.data()?.lastInboundPhoneId : null;
-      if (fromConv) return fromConv; // usar el mismo número que recibió
-    } catch { /* ignore */ }
+      if (fromConv) return fromConv;
+    } catch {
+      /* ignore */
+    }
   }
   return defaultPhoneId;
 }
@@ -89,8 +95,8 @@ function buildPreviewForSent({ sentType, text, template, image, audio, document 
   if (sentType === "text") {
     return typeof text === "string" ? text : (text?.body || "");
   }
+
   if (sentType === "template") {
-    // Vista previa legible, pero SOLO usa el texto de +24h si el nombre coincide
     try {
       const comps = Array.isArray(template?.components) ? template.components : [];
       const params = comps?.[0]?.parameters || [];
@@ -107,22 +113,16 @@ function buildPreviewForSent({ sentType, text, template, image, audio, document 
         return `¡Hola ${p1}! Soy ${p2} de ${p3}.`;
       }
 
-      // Genérico para cualquier otra plantilla (ej. promo_hogarcril_combos)
-      const parts = params.map(x => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
+      const parts = params.map((x) => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
       return parts.length ? `[Plantilla ${template?.name}] ${parts.join(" • ")}` : `[Plantilla ${template?.name}]`;
     } catch {
       return `[Plantilla ${template?.name || "enviada"}]`;
     }
   }
-  if (sentType === "image") {
-    return image?.caption || "[Imagen]";
-  }
-  if (sentType === "audio") {
-    return "[Audio]";
-  }
-  if (sentType === "document") {
-    return document?.caption || "[Documento]";
-  }
+
+  if (sentType === "image") return image?.caption || "[Imagen]";
+  if (sentType === "audio") return "[Audio]";
+  if (sentType === "document") return document?.caption || "[Documento]";
   return "";
 }
 
@@ -130,21 +130,52 @@ function buildPreviewForSent({ sentType, text, template, image, audio, document 
 export default async function handler(req, res) {
   setCors(res);
 
-  // Preflight siempre 204, sin inicializar nada
   if (req.method === "OPTIONS") return res.status(204).end();
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "method_not_allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
   try {
     if (!TOKEN) return res.status(500).json({ error: "server_misconfigured" });
 
-    // Import dinámico (para no romper OPTIONS)
-    const { db, FieldValue } = await import("../lib/firebaseAdmin.js");
+    // Import dinámico
+    const fb = await import("../lib/firebaseAdmin.js");
+    const admin = fb.default;
+    const { db, FieldValue } = fb;
 
-    const body = typeof req.body === "object" ? req.body : JSON.parse(req.body || "{}");
-    let { to, text, template, image, audio, document, fromWaPhoneId, phoneId, replyTo } = body;
+    // ✅ Auth Firebase (obligatorio)
+    const authH = req.headers.authorization || "";
+    const idToken = authH.startsWith("Bearer ") ? authH.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "Missing Bearer token" });
+
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    const senderUid = decoded?.uid || null;
+    const senderEmail = (decoded?.email || "").toLowerCase();
+
+    // Body robusto
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body || "{}"); } catch { body = {}; }
+    } else if (!body || typeof body !== "object") {
+      body = {};
+    }
+
+    let {
+      to,
+      text,
+      template,
+      image,
+      audio,
+      document,
+      fromWaPhoneId,
+      phoneId,
+      replyTo,
+      sellerName, // opcional
+    } = body;
 
     if (!to) return res.status(400).json({ error: "missing_to" });
     if (!text && !template && !image && !audio && !document) {
@@ -162,47 +193,33 @@ export default async function handler(req, res) {
       let delivered = null, usedToDigits = null, usedVariant = null, lastErr = null;
 
       for (const cand of cands) {
-        // --- Selección de payload (media > template > text) ---
         let payload;
-        if (image) {
-          payload = { type: "image", image };
-        } else if (audio) {
-          payload = { type: "audio", audio };
-        } else if (document) {
-          payload = { type: "document", document };
-        } else if (template) {
-          payload = { type: "template", template };
-        } else {
-          payload = { type: "text", text: { body: typeof text === "string" ? text : (text?.body || ""), preview_url: false } };
-        }
+        if (image) payload = { type: "image", image };
+        else if (audio) payload = { type: "audio", audio };
+        else if (document) payload = { type: "document", document };
+        else if (template) payload = { type: "template", template };
+        else payload = { type: "text", text: { body: typeof text === "string" ? text : (text?.body || ""), preview_url: false } };
 
-        // Contexto de respuesta (WhatsApp Business API requiere "context: { message_id }")
         const ctxId = replyTo?.wamid || replyTo?.id;
-        if (ctxId) {
-          payload.context = { message_id: String(ctxId) };
-        }
+        if (ctxId) payload.context = { message_id: String(ctxId) };
 
         const r = await sendToGraph(PHONE_ID, cand, payload);
         if (r.ok) {
           delivered = r.json;
           usedToDigits = cand;
           usedVariant = cand.startsWith("549") ? "549" : "5415";
-          break; // al primer éxito, salimos
+          break;
         }
         lastErr = r.json;
-        if (r?.json?.error?.code !== 131030) break; // si no es sandbox allow-list, no insistir
+        if (r?.json?.error?.code !== 131030) break;
       }
 
       const convId = normalizeE164AR(usedToDigits || cands[0]);
       const convRef = db.collection("conversations").doc(convId);
-      await convRef.set(
-        { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
-        { merge: true }
-      );
+
+      await convRef.set({ contactId: convId, lastMessageAt: FieldValue.serverTimestamp() }, { merge: true });
 
       const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
-
-      // tipo realmente enviado
       const sentType = image ? "image" : audio ? "audio" : document ? "document" : (template ? "template" : "text");
 
       const msgDoc = {
@@ -216,22 +233,24 @@ export default async function handler(req, res) {
         status: delivered ? "sent" : "error",
         raw: delivered || undefined,
         error: delivered ? undefined : (lastErr || { message: "send_failed" }),
+
+        // ✅ Auditoría
+        sentByUid: senderUid || undefined,
+        sentByEmail: senderEmail || undefined,
+        sellerName: sellerName || undefined,
       };
 
       if (sentType === "text") {
         msgDoc.text = typeof text === "string" ? text : (text?.body || "");
       }
 
-      // === Guardar template como objeto + textPreview (condicionado por nombre) ===
       if (sentType === "template") {
-        // Guardamos el objeto completo (para que el front lo pueda renderizar)
         msgDoc.template = {
           name: template?.name || null,
           language: template?.language || null,
           components: Array.isArray(template?.components) ? template.components : [],
         };
 
-        // textPreview: SOLO usa el copy de +24h si el nombre es el de reengage
         try {
           const name = String(msgDoc?.template?.name || "").toLowerCase();
           const envReengage = (process.env.VITE_WA_REENGAGE_TEMPLATE || "reengage_free_text").toLowerCase();
@@ -249,7 +268,7 @@ export default async function handler(req, res) {
               `Te escribo para retomar tu consulta ya que pasaron más de 24 horas desde el último mensaje.\n` +
               `Respondé a este mensaje para continuar la conversación.`;
           } else {
-            const parts = comps.map(x => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
+            const parts = comps.map((x) => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
             const label = msgDoc?.template?.name || "template";
             msgDoc.textPreview = parts.length ? `[Plantilla ${label}] ${parts.join(" • ")}` : `[Plantilla ${label}]`;
           }
@@ -260,14 +279,14 @@ export default async function handler(req, res) {
       }
 
       if (sentType === "image") {
-        const imgUrl = image?.link || image?.url || null; // aceptamos link o url
+        const imgUrl = image?.link || image?.url || null;
         msgDoc.media = {
           kind: "image",
-          ...(imgUrl ? { link: imgUrl, url: imgUrl } : {}), // ⬅️ duplicamos para el front
+          ...(imgUrl ? { link: imgUrl, url: imgUrl } : {}),
           ...(image?.id ? { id: image.id } : {}),
           ...(image?.caption ? { caption: image.caption } : {}),
         };
-        if (imgUrl) msgDoc.mediaUrl = imgUrl; // ⬅️ compat con UI
+        if (imgUrl) msgDoc.mediaUrl = imgUrl;
       }
 
       if (sentType === "audio") {
@@ -294,7 +313,6 @@ export default async function handler(req, res) {
 
       Object.keys(msgDoc).forEach((k) => msgDoc[k] === undefined && delete msgDoc[k]);
 
-      // Persistir replyTo expandido (compat front/back con text/snippet)
       if (replyTo) {
         msgDoc.replyTo = {
           id: replyTo.id || null,
@@ -307,18 +325,9 @@ export default async function handler(req, res) {
         };
       }
 
-      // === Guardar mensaje ===
       await convRef.collection("messages").doc(wamid).set(msgDoc, { merge: true });
 
-      // === Actualizar meta de conversación (preview consistente) ===
-      const preview = buildPreviewForSent({
-        sentType,
-        text,
-        template,
-        image,
-        audio,
-        document,
-      });
+      const preview = buildPreviewForSent({ sentType, text, template, image, audio, document });
 
       await convRef.set(
         {
@@ -341,7 +350,7 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(200).json({ ok: results.every(r => r.ok), results });
+    return res.status(200).json({ ok: results.every((r) => r.ok), results });
   } catch (err) {
     setCors(res);
     console.error("sendMessage error:", err);
