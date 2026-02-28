@@ -220,6 +220,80 @@ async function fetchMedia(mediaId, retryCount = 0) {
   }
 }
 
+/** (NUEVO) Descarga binario desde URL (referral Ads: image_url / thumbnail_url / video_url) */
+async function fetchUrlMedia(url, retryCount = 0) {
+  if (!url) return null;
+
+  const MAX_RETRIES = 2;
+  const TIMEOUT_MS = 6000;
+
+  // límite para no matar serverless con videos enormes
+  const MAX_BYTES = Number(process.env.MAX_AD_MEDIA_BYTES || 25 * 1024 * 1024); // 25MB default
+  const TRY_VIDEO = String(process.env.DOWNLOAD_AD_VIDEO || "").toLowerCase() === "true" ||
+    String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
+
+  // Nota: si es video y no querés bajarlo completo, lo decidimos afuera con TRY_VIDEO
+  console.log(`🔍 [fetchUrlMedia] url=${String(url).slice(0, 120)}... intento ${retryCount + 1}/${MAX_RETRIES + 1}`);
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+    // intento 1 sin auth
+    let res = await fetch(url, { signal: controller.signal });
+
+    // si no deja, intento 2 con bearer (a veces sirve)
+    if ((res.status === 401 || res.status === 403) && WA_TOKEN) {
+      res = await fetch(url, {
+        signal: controller.signal,
+        headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      });
+    }
+
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.error(`❌ [fetchUrlMedia] error ${res.status}: ${t.slice(0, 200)}`);
+      if (retryCount < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, 150));
+        return fetchUrlMedia(url, retryCount + 1);
+      }
+      return null;
+    }
+
+    const mime = res.headers.get("content-type") || "application/octet-stream";
+    const len = Number(res.headers.get("content-length") || 0);
+
+    if (len && len > MAX_BYTES) {
+      console.warn(`⚠️ [fetchUrlMedia] omitido por tamaño: ${len} > ${MAX_BYTES}`);
+      return { tooLarge: true, mime, size: len };
+    }
+
+    // si no hay content-length, igual descargamos (arrayBuffer), pero cortamos si supera MAX_BYTES con un fallback simple:
+    const arr = await res.arrayBuffer();
+    const buf = Buffer.from(arr);
+
+    if (buf.length > MAX_BYTES) {
+      console.warn(`⚠️ [fetchUrlMedia] descargado pero supera MAX_BYTES: ${buf.length} > ${MAX_BYTES}`);
+      return { tooLarge: true, mime, size: buf.length };
+    }
+
+    return { buf, mime, size: buf.length, TRY_VIDEO };
+  } catch (err) {
+    console.error(`💥 [fetchUrlMedia] Error:`, err?.message || err);
+
+    if (
+      retryCount < MAX_RETRIES &&
+      (err?.name === "AbortError" || err?.code === "ECONNRESET")
+    ) {
+      await new Promise((r) => setTimeout(r, 200));
+      return fetchUrlMedia(url, retryCount + 1);
+    }
+    return null;
+  }
+}
+
 /** Sube a Storage y devuelve URL firmada larga */
 async function saveToStorageAndSign(convId, waMessageId, mime, buf) {
   const ext = (mime.split("/")[1] || "bin").split(";")[0];
@@ -373,6 +447,126 @@ export default async function handler(req, res) {
         businessDisplay: phoneDisplay,
         raw: m,
       };
+
+      // =========================
+      // (NUEVO) REFERRAL ADS (click-to-whatsapp)
+      // =========================
+      if (m.referral) {
+        const r = m.referral;
+
+        // guardo metadata del anuncio
+        messageData.referral = stripUndefined({
+          sourceUrl: r.source_url || null,
+          sourceType: r.source_type || null, // "ad" | "post"
+          sourceId: r.source_id || null,
+          headline: r.headline || null,
+          body: r.body || null,
+          mediaType: r.media_type || null,   // "image" | "video"
+          imageUrl: r.image_url || null,
+          videoUrl: r.video_url || null,
+          thumbnailUrl: r.thumbnail_url || null,
+        });
+
+        // para preview/listado si el texto viene vacío
+        if ((!messageData.text || String(messageData.text).trim() === "") && (r.headline || r.body)) {
+          messageData.text = r.body || r.headline || messageData.text;
+          messageData.textPreview = `📣 Anuncio: ${r.headline || r.body}`.slice(0, 200);
+        }
+
+        // descarga best-effort a Storage (imagen o thumbnail del video)
+        try {
+          const mediaType = String(r.media_type || "").toLowerCase();
+          const wantsVideoDownload =
+            String(process.env.DOWNLOAD_AD_VIDEO || "").toLowerCase() === "true" ||
+            String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
+
+          let savedImage = null;
+          let savedThumb = null;
+          let savedVideo = null;
+
+          // 1) Imagen del anuncio
+          if (mediaType === "image" && r.image_url) {
+            const file = await fetchUrlMedia(r.image_url);
+            if (file?.tooLarge) {
+              messageData.referralMediaError = "AD_IMAGE_TOO_LARGE";
+            } else if (file?.buf) {
+              savedImage = await saveToStorageAndSign(
+                convId,
+                `${waMessageId}_ad_image`,
+                file.mime,
+                file.buf
+              );
+            }
+          }
+
+          // 2) Video: siempre intento thumbnail (para mostrar en UI)
+          if (mediaType === "video") {
+            const thumbUrl = r.thumbnail_url || null;
+            if (thumbUrl) {
+              const file = await fetchUrlMedia(thumbUrl);
+              if (file?.tooLarge) {
+                messageData.referralMediaError = "AD_THUMB_TOO_LARGE";
+              } else if (file?.buf) {
+                savedThumb = await saveToStorageAndSign(
+                  convId,
+                  `${waMessageId}_ad_thumb`,
+                  file.mime,
+                  file.buf
+                );
+              }
+            }
+
+            // 3) Video completo (OPCIONAL, puede ser grande)
+            if (wantsVideoDownload && r.video_url) {
+              const file = await fetchUrlMedia(r.video_url);
+              if (file?.tooLarge) {
+                messageData.referralMediaError = "AD_VIDEO_TOO_LARGE";
+              } else if (file?.buf) {
+                savedVideo = await saveToStorageAndSign(
+                  convId,
+                  `${waMessageId}_ad_video`,
+                  file.mime,
+                  file.buf
+                );
+              }
+            }
+          }
+
+          // guardo lo almacenado (si hubo)
+          const stored = stripUndefined({
+            image: savedImage
+              ? { path: savedImage.path, url: savedImage.url }
+              : undefined,
+            thumbnail: savedThumb
+              ? { path: savedThumb.path, url: savedThumb.url }
+              : undefined,
+            video: savedVideo
+              ? { path: savedVideo.path, url: savedVideo.url }
+              : undefined,
+          });
+
+          if (stored && Object.keys(stored).length) {
+            messageData.referralStored = stored;
+
+            // helper para UI: un "previewUrl" directo
+            const previewUrl =
+              stored.image?.url ||
+              stored.thumbnail?.url ||
+              null;
+
+            if (previewUrl) {
+              messageData.referralPreviewUrl = previewUrl;
+            }
+          } else {
+            // si no guardé nada, igual puedo mostrar el link original en UI
+            const previewUrl = r.image_url || r.thumbnail_url || null;
+            if (previewUrl) messageData.referralPreviewUrl = previewUrl;
+          }
+        } catch (e) {
+          console.error("[referral] error descargando media del anuncio:", e);
+          messageData.referralMediaError = "AD_MEDIA_DOWNLOAD_FAILED";
+        }
+      }
 
       // === CONTACTS ===
       if (m.type === "contacts") {
@@ -658,11 +852,17 @@ export default async function handler(req, res) {
           if (tokens.length) {
             const admin = (await import("firebase-admin")).default;
 
+            const pushBody =
+              text ||
+              cleanMessage?.textPreview ||
+              cleanMessage?.referral?.headline ||
+              (cleanMessage?.media?.kind ? `[${cleanMessage.media.kind}]` : "Toca para abrir la conversación");
+
             const resp = await admin.messaging().sendEachForMulticast({
               tokens,
               notification: {
                 title: "Nuevo mensaje",
-                body: text || "Toca para abrir la conversación",
+                body: String(pushBody).slice(0, 120),
               },
               data: { url, conversationId: convId },
               webpush: { fcmOptions: { link: url } },
@@ -691,8 +891,29 @@ export default async function handler(req, res) {
 
             if (to) {
               const who = convId;
+
               const preview =
-                text || (cleanMessage?.media?.kind ? `[${cleanMessage.media.kind}]` : "Nuevo mensaje");
+                text ||
+                cleanMessage?.textPreview ||
+                cleanMessage?.referral?.headline ||
+                (cleanMessage?.media?.kind ? `[${cleanMessage.media.kind}]` : "Nuevo mensaje");
+
+              // Si viene referral, agrego una mini-sección con la imagen/thumbnail del anuncio (si la tengo)
+              const adImg =
+                cleanMessage?.referralStored?.image?.url ||
+                cleanMessage?.referralStored?.thumbnail?.url ||
+                cleanMessage?.referralPreviewUrl ||
+                null;
+
+              const adBlock = cleanMessage?.referral
+                ? `
+                  <hr style="border:none;border-top:1px solid #e5e7eb;margin:14px 0" />
+                  <p><strong>Origen: Anuncio</strong></p>
+                  ${cleanMessage.referral.headline ? `<p><b>Título:</b> ${String(cleanMessage.referral.headline).replace(/</g, "&lt;")}</p>` : ""}
+                  ${cleanMessage.referral.body ? `<p><b>Texto:</b> ${String(cleanMessage.referral.body).replace(/</g, "&lt;")}</p>` : ""}
+                  ${adImg ? `<p><img src="${adImg}" alt="Anuncio" style="max-width:420px;border-radius:10px" /></p>` : ""}
+                `
+                : "";
 
               await sendEmail({
                 to,
@@ -702,6 +923,7 @@ export default async function handler(req, res) {
                     <p><strong>Nuevo mensaje entrante</strong></p>
                     <p><b>Conversación:</b> ${who}</p>
                     <p><b>Texto:</b> ${String(preview).replace(/</g, "&lt;")}</p>
+                    ${adBlock}
                     <p>
                       <a href="${url}" style="display:inline-block;padding:10px 14px;background:#2E7D32;color:#fff;text-decoration:none;border-radius:6px">
                         Abrir conversación
