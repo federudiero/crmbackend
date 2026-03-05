@@ -19,18 +19,34 @@ function safeParseBody(req) {
 
 const digits = (s) => String(s || "").replace(/\D/g, "");
 
-// ✅ fix: si no hay dígitos, no devuelvas "+"
+// ✅ Normalización canónica (misma idea que send-template/sendMessage)
+// - Devuelve "" si no hay dígitos válidos
+// - Soporta prefijo 00 (internacional) y ceros de salida
+// - AR móvil canónico: +549XXXXXXXXXX
+// - AR legacy: +54 <area> 15 <local>  => +549<area><local>
 function normalizeE164AR(waIdOrPhone) {
-  const d = digits(waIdOrPhone);
+  // Canonical convId: +549XXXXXXXXXX (AR mobiles) or +<digits> for others
+  let d = digits(waIdOrPhone);
   if (!d) return "";
+
+  // handle prefixes like 00 (international) and trunk 0
+  if (d.startsWith("00")) d = d.slice(2);
+  d = d.replace(/^0+/, "");
+
+  // Argentina mobile canonical
   if (d.startsWith("549")) return `+${d}`;
+
+  // Argentina legacy: +54 <area> 15 <local>  => +549<area><local>
   const m = d.match(/^54(\d{2,4})15(\d+)$/);
   if (m) {
     const [, area, local] = m;
     return `+549${area}${local}`;
   }
+
+  // Generic E.164-ish
   if (d.startsWith("54")) return `+${d}`;
-  return `+${d}`;
+  if (d.length >= 8 && d.length <= 15) return `+${d}`;
+  return "";
 }
 
 function extractTextFromMessage(m) {
@@ -48,7 +64,7 @@ function extractTextFromMessage(m) {
       c?.phones?.[0]?.phone ||
       c?.phones?.[0]?.value ||
       "";
-    const phone = ph ? `+${digits(ph)}` : "";
+    const phone = ph ? normalizeE164AR(ph) : "";
 
     const parts = [name || null, phone || null].filter(Boolean);
     if (parts.length) return `📇 Contacto: ${parts.join(" · ")}`;
@@ -229,11 +245,14 @@ async function fetchUrlMedia(url, retryCount = 0) {
 
   // límite para no matar serverless con videos enormes
   const MAX_BYTES = Number(process.env.MAX_AD_MEDIA_BYTES || 25 * 1024 * 1024); // 25MB default
-  const TRY_VIDEO = String(process.env.DOWNLOAD_AD_VIDEO || "").toLowerCase() === "true" ||
+  const TRY_VIDEO =
+    String(process.env.DOWNLOAD_AD_VIDEO || "").toLowerCase() === "true" ||
     String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
 
-  // Nota: si es video y no querés bajarlo completo, lo decidimos afuera con TRY_VIDEO
-  console.log(`🔍 [fetchUrlMedia] url=${String(url).slice(0, 120)}... intento ${retryCount + 1}/${MAX_RETRIES + 1}`);
+  console.log(
+    `🔍 [fetchUrlMedia] url=${String(url).slice(0, 120)}... intento ${retryCount + 1
+    }/${MAX_RETRIES + 1}`
+  );
 
   try {
     const controller = new AbortController();
@@ -254,7 +273,9 @@ async function fetchUrlMedia(url, retryCount = 0) {
 
     if (!res.ok) {
       const t = await res.text().catch(() => "");
-      console.error(`❌ [fetchUrlMedia] error ${res.status}: ${t.slice(0, 200)}`);
+      console.error(
+        `❌ [fetchUrlMedia] error ${res.status}: ${t.slice(0, 200)}`
+      );
       if (retryCount < MAX_RETRIES) {
         await new Promise((r) => setTimeout(r, 150));
         return fetchUrlMedia(url, retryCount + 1);
@@ -262,20 +283,24 @@ async function fetchUrlMedia(url, retryCount = 0) {
       return null;
     }
 
-    const mime = res.headers.get("content-type") || "application/octet-stream";
+    const mime =
+      res.headers.get("content-type") || "application/octet-stream";
     const len = Number(res.headers.get("content-length") || 0);
 
     if (len && len > MAX_BYTES) {
-      console.warn(`⚠️ [fetchUrlMedia] omitido por tamaño: ${len} > ${MAX_BYTES}`);
+      console.warn(
+        `⚠️ [fetchUrlMedia] omitido por tamaño: ${len} > ${MAX_BYTES}`
+      );
       return { tooLarge: true, mime, size: len };
     }
 
-    // si no hay content-length, igual descargamos (arrayBuffer), pero cortamos si supera MAX_BYTES con un fallback simple:
     const arr = await res.arrayBuffer();
     const buf = Buffer.from(arr);
 
     if (buf.length > MAX_BYTES) {
-      console.warn(`⚠️ [fetchUrlMedia] descargado pero supera MAX_BYTES: ${buf.length} > ${MAX_BYTES}`);
+      console.warn(
+        `⚠️ [fetchUrlMedia] descargado pero supera MAX_BYTES: ${buf.length} > ${MAX_BYTES}`
+      );
       return { tooLarge: true, mime, size: buf.length };
     }
 
@@ -342,7 +367,10 @@ export default async function handler(req, res) {
       const text = extractTextFromMessage(m);
 
       if (!convId || !waMessageId) {
-        console.warn("[waWebhook] skip message missing convId/waMessageId", { convId, waMessageId });
+        console.warn("[waWebhook] skip message missing convId/waMessageId", {
+          convId,
+          waMessageId,
+        });
         continue;
       }
 
@@ -461,24 +489,30 @@ export default async function handler(req, res) {
           sourceId: r.source_id || null,
           headline: r.headline || null,
           body: r.body || null,
-          mediaType: r.media_type || null,   // "image" | "video"
+          mediaType: r.media_type || null, // "image" | "video"
           imageUrl: r.image_url || null,
           videoUrl: r.video_url || null,
           thumbnailUrl: r.thumbnail_url || null,
         });
 
         // para preview/listado si el texto viene vacío
-        if ((!messageData.text || String(messageData.text).trim() === "") && (r.headline || r.body)) {
+        if (
+          (!messageData.text || String(messageData.text).trim() === "") &&
+          (r.headline || r.body)
+        ) {
           messageData.text = r.body || r.headline || messageData.text;
-          messageData.textPreview = `📣 Anuncio: ${r.headline || r.body}`.slice(0, 200);
+          messageData.textPreview = `📣 Anuncio: ${r.headline || r.body}`.slice(
+            0,
+            200
+          );
         }
 
         // descarga best-effort a Storage (imagen o thumbnail del video)
         try {
           const mediaType = String(r.media_type || "").toLowerCase();
           const wantsVideoDownload =
-            String(process.env.DOWNLOAD_AD_VIDEO || "").toLowerCase() === "true" ||
-            String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
+            String(process.env.DOWNLOAD_AD_VIDEO || "").toLowerCase() ===
+            "true" || String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
 
           let savedImage = null;
           let savedThumb = null;
@@ -549,10 +583,7 @@ export default async function handler(req, res) {
             messageData.referralStored = stored;
 
             // helper para UI: un "previewUrl" directo
-            const previewUrl =
-              stored.image?.url ||
-              stored.thumbnail?.url ||
-              null;
+            const previewUrl = stored.image?.url || stored.thumbnail?.url || null;
 
             if (previewUrl) {
               messageData.referralPreviewUrl = previewUrl;
@@ -575,20 +606,23 @@ export default async function handler(req, res) {
         const formatted = c?.name?.formatted_name;
         const first = c?.name?.first_name;
         const last = c?.name?.last_name;
-        const name = (formatted || [first, last].filter(Boolean).join(" ")).trim() || null;
+        const name =
+          (formatted || [first, last].filter(Boolean).join(" ")).trim() || null;
 
         const ph =
           c?.phones?.[0]?.wa_id ||
           c?.phones?.[0]?.phone ||
           c?.phones?.[0]?.value ||
           "";
-        const phone = ph ? `+${digits(ph)}` : null;
+        const phone = ph ? normalizeE164AR(ph) : null;
 
         messageData.contact = stripUndefined({ name, phone, raw: c });
 
         if (!messageData.text || messageData.text.trim() === "") {
           const parts = [name, phone].filter(Boolean);
-          messageData.text = parts.length ? `📇 Contacto: ${parts.join(" · ")}` : "📇 Contacto";
+          messageData.text = parts.length
+            ? `📇 Contacto: ${parts.join(" · ")}`
+            : "📇 Contacto";
         }
         messageData.textPreview = messageData.text;
       }
@@ -805,7 +839,8 @@ export default async function handler(req, res) {
 
               replyTo.text = visible.slice(0, 200);
               replyTo.snippet = replyTo.text;
-              replyTo.from = orig?.from || (orig?.direction === "out" ? "agent" : "client");
+              replyTo.from =
+                orig?.from || (orig?.direction === "out" ? "agent" : "client");
               replyTo.createdAt = orig?.timestamp || null;
             }
           } catch { }
@@ -856,7 +891,9 @@ export default async function handler(req, res) {
               text ||
               cleanMessage?.textPreview ||
               cleanMessage?.referral?.headline ||
-              (cleanMessage?.media?.kind ? `[${cleanMessage.media.kind}]` : "Toca para abrir la conversación");
+              (cleanMessage?.media?.kind
+                ? `[${cleanMessage.media.kind}]`
+                : "Toca para abrir la conversación");
 
             const resp = await admin.messaging().sendEachForMulticast({
               tokens,
@@ -886,7 +923,9 @@ export default async function handler(req, res) {
             let to = assignedToEmailInConv;
             if (!to) {
               const u = await db.collection("users").doc(String(assignedToUid)).get();
-              to = u.exists ? (u.get("email") || u.get("assignedToEmail") || null) : null;
+              to = u.exists
+                ? (u.get("email") || u.get("assignedToEmail") || null)
+                : null;
             }
 
             if (to) {
@@ -896,7 +935,9 @@ export default async function handler(req, res) {
                 text ||
                 cleanMessage?.textPreview ||
                 cleanMessage?.referral?.headline ||
-                (cleanMessage?.media?.kind ? `[${cleanMessage.media.kind}]` : "Nuevo mensaje");
+                (cleanMessage?.media?.kind
+                  ? `[${cleanMessage.media.kind}]`
+                  : "Nuevo mensaje");
 
               // Si viene referral, agrego una mini-sección con la imagen/thumbnail del anuncio (si la tengo)
               const adImg =
@@ -961,7 +1002,7 @@ export default async function handler(req, res) {
           stripUndefined({
             status: s.status,
             statusTimestamp: FieldValue.serverTimestamp(), // server time
-            ...(statusAt ? { statusAt } : {}),            // event time si viene
+            ...(statusAt ? { statusAt } : {}), // event time si viene
             rawStatus: s,
           }),
           { merge: true }
