@@ -121,14 +121,31 @@ function canonicalConvIdAR(raw) {
 }
 
 // ====== sanitize (Meta) ======
+// ✅ Mantiene saltos de línea (\n) para que los combos lleguen separados.
+// Limpia CR/TAB y normaliza espacios por línea (sin romper \n).
 function sanitizeParamServer(input) {
   if (input === "\u200B") return input; // ZWSP permitido
   let x = String(input ?? "");
 
-  x = x.replace(/[\r\t]+/g, " ");
-  x = x.replace(/\n+/g, " • ");
-  x = x.replace(/\s{2,}/g, " ");
-  x = x.replace(/ {5,}/g, "    ");
+  // normalizar saltos
+  x = x.replace(/\r\n?/g, "\n"); // CRLF/CR -> LF
+  x = x.replace(/\t+/g, " ");    // tabs -> espacio
+
+  // no permitir demasiadas líneas vacías
+  x = x.replace(/\n{3,}/g, "\n\n"); // max 2 saltos seguidos
+
+  // limpiar espacios por línea (sin usar \s que rompe \n)
+  x = x
+    .split("\n")
+    .map((line) => {
+      let y = line;
+      y = y.replace(/[\f\v]+/g, " ");
+      y = y.replace(/ {5,}/g, "    "); // por compat con tu regla vieja
+      y = y.replace(/ {2,}/g, " ");    // colapsa espacios (solo espacios)
+      return y.trim();
+    })
+    .join("\n");
+
   x = x.trim();
 
   const MAX_PARAM_LEN = 1000;
@@ -155,6 +172,7 @@ function previewFromVars(tName, vars) {
     if (!out) out = `[Plantilla ${tName}]`;
   }
 
+  // Preview “corto” para conversaciones/lista
   const MAX = 220;
   const compact = out.replace(/\s+/g, " ").trim();
   return compact.length > MAX ? compact.slice(0, MAX - 1) + "…" : compact;
@@ -259,10 +277,7 @@ export default async function handler(req, res) {
 
     const tplObj = input?.template || null;
 
-    const requested = String(
-      input?.templateName || input?.name || tplObj?.name || DEFAULT_TEMPLATE
-    ).trim();
-
+    const requested = String(input?.templateName || input?.name || tplObj?.name || DEFAULT_TEMPLATE).trim();
     const tName = ALLOWED_TEMPLATES.has(requested) ? requested : DEFAULT_TEMPLATE;
 
     // language puede venir como string ("es_AR") o como { code: "es_AR" }
@@ -323,9 +338,6 @@ export default async function handler(req, res) {
     ];
 
     // ====== Seguridad / compliance: opt-in ======
-    // - marketingOptIn === false => BLOQUEA siempre
-    // - modo estricto REQUIRE_MARKETING_OPTIN=1 => exige marketingOptIn===true
-    // - modo legacy REQUIRE_MARKETING_OPTIN=0 => permite (marketingOptIn===true o undefined) mientras optIn===true
     try {
       const convIdForCheck = canonicalConvIdAR(toRaw);
       if (!convIdForCheck) return res.status(400).json({ error: "Invalid phone (not AR canonical)" });
@@ -450,11 +462,11 @@ export default async function handler(req, res) {
             language: lang,
             components: fixedComponents,
           },
-          vars, // ✅ para render exacto en front
+          vars, // ✅ para render exacto en front (ahora puede traer \n)
           textPreview,
           businessPhoneId: PHONE_ID,
           timestamp: FieldValue.serverTimestamp(),
-          status: "sent", // “aceptado por Graph”; delivered/read se actualiza con webhooks si querés
+          status: "sent",
           sendVariant: usedToDigits?.startsWith("549") ? "549" : "5415",
           to: convId,
           toRawSent: usedToDigits ? `+${usedToDigits}` : undefined,
