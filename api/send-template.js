@@ -22,9 +22,9 @@ const REQUIRE_MARKETING_OPTIN = String(process.env.REQUIRE_MARKETING_OPTIN || "0
 const ALLOWED_TEMPLATES = new Set(["promo_hogarcril_combos", "reengage_free_text"]);
 const DEFAULT_TEMPLATE = "promo_hogarcril_combos";
 
-// Cantidad esperada de variables por template (evita mandar de más)
+// Cantidad esperada de variables por template
 const TEMPLATE_PARAM_COUNT = {
-  promo_hogarcril_combos: 3,
+  promo_hogarcril_combos: 6,
   reengage_free_text: 1,
 };
 
@@ -119,21 +119,15 @@ function canonicalConvIdAR(raw) {
   return "";
 }
 
-// ====== sanitize (Meta) ======
-// ✅ Mantiene saltos de línea (\n) para que los combos lleguen separados.
-// Limpia CR/TAB y normaliza espacios por línea (sin romper \n).
-function sanitizeParamServer(input) {
+// ====== sanitize ======
+function sanitizeDisplayText(input) {
   if (input === "\u200B") return input; // ZWSP permitido
+
   let x = String(input ?? "");
+  x = x.replace(/\r\n?/g, "\n");
+  x = x.replace(/\t+/g, " ");
+  x = x.replace(/\n{3,}/g, "\n\n");
 
-  // normalizar saltos
-  x = x.replace(/\r\n?/g, "\n"); // CRLF/CR -> LF
-  x = x.replace(/\t+/g, " "); // tabs -> espacio
-
-  // no permitir demasiadas líneas vacías
-  x = x.replace(/\n{3,}/g, "\n\n"); // max 2 saltos seguidos
-
-  // limpiar espacios por línea (sin usar \s que rompe \n)
   x = x
     .split("\n")
     .map((line) => {
@@ -143,12 +137,27 @@ function sanitizeParamServer(input) {
       y = y.replace(/ {2,}/g, " ");
       return y.trim();
     })
-    .join("\n");
+    .join("\n")
+    .trim();
 
+  const MAX = 1000;
+  if (x.length > MAX) x = x.slice(0, MAX - 1) + "…";
+  return x;
+}
+
+function sanitizeParamForMeta(input) {
+  if (input === "\u200B") return input; // ZWSP permitido
+
+  let x = String(input ?? "");
+  x = x.replace(/\r\n?/g, "\n");
+  x = x.replace(/\t+/g, " ");
+  x = x.replace(/\n+/g, " "); // Meta NO acepta saltos dentro del parámetro
+  x = x.replace(/ {5,}/g, "    "); // máximo 4 espacios seguidos
+  x = x.replace(/ {2,}/g, " ");
   x = x.trim();
 
-  const MAX_PARAM_LEN = 1000;
-  if (x.length > MAX_PARAM_LEN) x = x.slice(0, MAX_PARAM_LEN - 1) + "…";
+  const MAX = 1000;
+  if (x.length > MAX) x = x.slice(0, MAX - 1) + "…";
   return x;
 }
 
@@ -157,29 +166,55 @@ function stripZWSP(s) {
   return x === "\u200B" ? "" : x;
 }
 
-function buildResolvedTextFromVars(tName, vars) {
-  const v1 = stripZWSP(vars?.[0]);
-  const v2 = stripZWSP(vars?.[1]);
-  const v3 = stripZWSP(vars?.[2]);
+function fallbackKeysForIndex(idx) {
+  switch (idx) {
+    case 0:
+      return ["v1", "var1", "body1", "saludo", "nombre", "cliente", "name1"];
+    case 1:
+      return ["v2", "var2", "body2", "vendedor", "seller", "vendedora", "name2"];
+    case 2:
+      return ["v3", "var3", "body3", "promo1", "promo_1", "combo1", "combo_1", "item1", "name3"];
+    case 3:
+      return ["v4", "var4", "body4", "promo2", "promo_2", "combo2", "combo_2", "item2", "name4"];
+    case 4:
+      return ["v5", "var5", "body5", "promo3", "promo_3", "combo3", "combo_3", "item3", "name5"];
+    case 5:
+      return ["v6", "var6", "body6", "promo4", "promo_4", "combo4", "combo_4", "item4", "name6"];
+    default:
+      return [`v${idx + 1}`, `var${idx + 1}`, `body${idx + 1}`, `name${idx + 1}`];
+  }
+}
 
-  let out = "";
+function buildResolvedTextFromVars(tName, vars) {
+  const v1 = stripZWSP(vars?.[0]); // cliente
+  const v2 = stripZWSP(vars?.[1]); // vendedora
+  const promos = (vars || []).slice(2).map(stripZWSP).filter(Boolean);
 
   if (tName === "reengage_free_text") {
-    out = v1 || `[Plantilla ${tName}]`;
+    return (v1 || `[Plantilla ${tName}]`).trim();
+  }
+
+  if (tName === "promo_hogarcril_combos") {
+    let header = "";
+
+    if (v1 && v2) {
+      header = `Hola ${v1}, soy ${v2} de Hogar Cril. Hoy tenemos estas promos:`;
+    } else if (v1) {
+      header = `Hola ${v1}. Hoy tenemos estas promos:`;
+    } else if (v2) {
+      header = `Hola, soy ${v2} de Hogar Cril. Hoy tenemos estas promos:`;
+    } else {
+      header = "Hoy tenemos estas promos:";
+    }
+
+    let out = header;
+    if (promos.length) out += `\n\n${promos.join("\n")}`;
+    out += "\n\n¿Querés que te reserve alguno?`"
+
     return out.trim();
   }
 
-  if (v1 || v2) {
-    out += `Hola${v1 ? " " + v1 : ""}${v2 ? ", soy " + v2 : ""}.`;
-  }
-
-  if (v3) {
-    out += (out ? "\n\n" : "") + v3;
-  }
-
-  if (!out) out = `[Plantilla ${tName}]`;
-
-  return out.trim();
+  return `[Plantilla ${tName}]`;
 }
 
 function previewFromVars(tName, vars) {
@@ -286,8 +321,6 @@ export default async function handler(req, res) {
     // ── Body (acepta payload viejo y nuevo)
     const input = await readJson(req);
 
-    // Nuevo formato: { to, template: { name, language, components } }
-    // Viejo formato: { phone, components }
     const toRaw =
       input?.to || input?.phone || input?.contactId || input?.contact || input?.number;
 
@@ -314,33 +347,12 @@ export default async function handler(req, res) {
           ? tplObj.components
           : [];
 
-    // ====== Fallback vars si no vienen components ======
-    const pick = (...keys) => {
-      for (const k of keys) {
-        const v = typeof input?.[k] === "string" ? input[k] : null;
-        if (v && v.trim() !== "") return v;
-      }
-      return null;
-    };
-
-    const vFallback = [
-      sanitizeParamServer(
-        pick("v1", "var1", "body1", "saludo", "nombre", "name1") || "\u200B"
-      ),
-      sanitizeParamServer(
-        pick("v2", "var2", "body2", "vendedor", "seller", "name2") || "\u200B"
-      ),
-      sanitizeParamServer(
-        pick("v3", "var3", "body3", "promos", "texto", "lista", "body", "name3") || "\u200B"
-      ),
-    ];
-
     // ====== Normalizar components/body/params ======
     const norm = (incomingComponents || []).map((c) => ({
       type: String(c?.type || "body").toLowerCase(),
       parameters: (c?.parameters || []).map((p) => ({
         type: "text",
-        text: sanitizeParamServer(p?.text),
+        text: sanitizeDisplayText(p?.text),
       })),
     }));
 
@@ -350,18 +362,40 @@ export default async function handler(req, res) {
     const expectedCount =
       TEMPLATE_PARAM_COUNT[tName] ?? Math.max(1, providedParams.length || 1);
 
-    // vars finales: EXACTA cantidad esperada
+    // ====== Fallback vars si no vienen components ======
+    const pick = (...keys) => {
+      for (const k of keys) {
+        const v = typeof input?.[k] === "string" ? input[k] : null;
+        if (v && v.trim() !== "") return v;
+      }
+      return null;
+    };
+
+    const vFallback = Array.from({ length: expectedCount }, (_, idx) => {
+      const keys = fallbackKeysForIndex(idx);
+      const value = pick(...keys);
+      return sanitizeDisplayText(value ?? "\u200B");
+    });
+
+    // vars finales: una versión para CRM y otra para Meta
     const vars = [];
+    const metaVars = [];
+
     for (let i = 0; i < expectedCount; i++) {
       const fromProvided = providedParams?.[i]?.text;
       const fromFallback = vFallback?.[i] ?? "\u200B";
-      vars.push(sanitizeParamServer(fromProvided ?? fromFallback));
+
+      const displayValue = sanitizeDisplayText(fromProvided ?? fromFallback);
+      const metaValue = sanitizeParamForMeta(displayValue);
+
+      vars.push(displayValue);
+      metaVars.push(metaValue);
     }
 
     const fixedComponents = [
       {
         type: "body",
-        parameters: vars.map((x) => ({ type: "text", text: x })),
+        parameters: metaVars.map((x) => ({ type: "text", text: x })),
       },
     ];
 
@@ -494,7 +528,8 @@ export default async function handler(req, res) {
             language: lang,
             components: fixedComponents,
           },
-          vars,
+          vars,        // para mostrar en CRM
+          metaVars,    // lo que se mandó realmente a Meta
           text: resolvedText,
           resolvedText,
           body: resolvedText,
