@@ -3,7 +3,7 @@
 // - CORS allowlist dinámica
 // - Acepta payload viejo/nuevo (front viejo: { phone, components } / nuevo: { to, template: {...} })
 // - Envía EXACTA cantidad de variables por template
-// - Guarda preview útil (incluye v3/promos)
+// - Guarda preview útil + texto resuelto completo
 // - Opt-in: por defecto permite legacy (marketingOptIn undefined) si optIn=true
 //   Si querés modo estricto: REQUIRE_MARKETING_OPTIN=1 => exige marketingOptIn===true
 
@@ -113,7 +113,6 @@ function canonicalConvIdAR(raw) {
   const cands = candidatesForSendAR(raw);
   for (const c of cands) {
     const n = tryOne(c);
-    // preferimos canónico +549 si aparece
     if (n && n.startsWith("+549")) return n;
     if (n) return n;
   }
@@ -129,7 +128,7 @@ function sanitizeParamServer(input) {
 
   // normalizar saltos
   x = x.replace(/\r\n?/g, "\n"); // CRLF/CR -> LF
-  x = x.replace(/\t+/g, " ");    // tabs -> espacio
+  x = x.replace(/\t+/g, " "); // tabs -> espacio
 
   // no permitir demasiadas líneas vacías
   x = x.replace(/\n{3,}/g, "\n\n"); // max 2 saltos seguidos
@@ -140,8 +139,8 @@ function sanitizeParamServer(input) {
     .map((line) => {
       let y = line;
       y = y.replace(/[\f\v]+/g, " ");
-      y = y.replace(/ {5,}/g, "    "); // por compat con tu regla vieja
-      y = y.replace(/ {2,}/g, " ");    // colapsa espacios (solo espacios)
+      y = y.replace(/ {5,}/g, "    ");
+      y = y.replace(/ {2,}/g, " ");
       return y.trim();
     })
     .join("\n");
@@ -158,23 +157,40 @@ function stripZWSP(s) {
   return x === "\u200B" ? "" : x;
 }
 
-function previewFromVars(tName, vars) {
+function buildResolvedTextFromVars(tName, vars) {
   const v1 = stripZWSP(vars?.[0]);
   const v2 = stripZWSP(vars?.[1]);
   const v3 = stripZWSP(vars?.[2]);
 
   let out = "";
+
   if (tName === "reengage_free_text") {
     out = v1 || `[Plantilla ${tName}]`;
-  } else {
-    if (v1 || v2) out += `Hola${v1 ? " " + v1 : ""}${v2 ? ", soy " + v2 : ""}.`;
-    if (v3) out += (out ? "\n" : "") + v3;
-    if (!out) out = `[Plantilla ${tName}]`;
+    return out.trim();
   }
 
-  // Preview “corto” para conversaciones/lista
+  if (v1 || v2) {
+    out += `Hola${v1 ? " " + v1 : ""}${v2 ? ", soy " + v2 : ""}.`;
+  }
+
+  if (v3) {
+    out += (out ? "\n\n" : "") + v3;
+  }
+
+  if (!out) out = `[Plantilla ${tName}]`;
+
+  return out.trim();
+}
+
+function previewFromVars(tName, vars) {
+  const full = buildResolvedTextFromVars(tName, vars);
+
   const MAX = 220;
-  const compact = out.replace(/\s+/g, " ").trim();
+  const compact = full
+    .replace(/\n+/g, " • ")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+
   return compact.length > MAX ? compact.slice(0, MAX - 1) + "…" : compact;
 }
 
@@ -272,16 +288,23 @@ export default async function handler(req, res) {
 
     // Nuevo formato: { to, template: { name, language, components } }
     // Viejo formato: { phone, components }
-    const toRaw = input?.to || input?.phone || input?.contactId || input?.contact || input?.number;
+    const toRaw =
+      input?.to || input?.phone || input?.contactId || input?.contact || input?.number;
+
     if (!toRaw) return res.status(400).json({ error: "Missing phone/to" });
 
     const tplObj = input?.template || null;
 
-    const requested = String(input?.templateName || input?.name || tplObj?.name || DEFAULT_TEMPLATE).trim();
+    const requested = String(
+      input?.templateName || input?.name || tplObj?.name || DEFAULT_TEMPLATE
+    ).trim();
+
     const tName = ALLOWED_TEMPLATES.has(requested) ? requested : DEFAULT_TEMPLATE;
 
     // language puede venir como string ("es_AR") o como { code: "es_AR" }
-    const lang = String(input?.languageCode || tplObj?.language?.code || tplObj?.language || "es_AR");
+    const lang = String(
+      input?.languageCode || tplObj?.language?.code || tplObj?.language || "es_AR"
+    );
 
     // components puede venir en input.components o en template.components
     const incomingComponents =
@@ -301,9 +324,15 @@ export default async function handler(req, res) {
     };
 
     const vFallback = [
-      sanitizeParamServer(pick("v1", "var1", "body1", "saludo", "nombre", "name1") || "\u200B"),
-      sanitizeParamServer(pick("v2", "var2", "body2", "vendedor", "seller", "name2") || "\u200B"),
-      sanitizeParamServer(pick("v3", "var3", "body3", "promos", "texto", "lista", "body", "name3") || "\u200B"),
+      sanitizeParamServer(
+        pick("v1", "var1", "body1", "saludo", "nombre", "name1") || "\u200B"
+      ),
+      sanitizeParamServer(
+        pick("v2", "var2", "body2", "vendedor", "seller", "name2") || "\u200B"
+      ),
+      sanitizeParamServer(
+        pick("v3", "var3", "body3", "promos", "texto", "lista", "body", "name3") || "\u200B"
+      ),
     ];
 
     // ====== Normalizar components/body/params ======
@@ -319,8 +348,7 @@ export default async function handler(req, res) {
     const providedParams = bodyComp?.parameters || [];
 
     const expectedCount =
-      TEMPLATE_PARAM_COUNT[tName] ??
-      Math.max(1, providedParams.length || 1);
+      TEMPLATE_PARAM_COUNT[tName] ?? Math.max(1, providedParams.length || 1);
 
     // vars finales: EXACTA cantidad esperada
     const vars = [];
@@ -340,7 +368,9 @@ export default async function handler(req, res) {
     // ====== Seguridad / compliance: opt-in ======
     try {
       const convIdForCheck = canonicalConvIdAR(toRaw);
-      if (!convIdForCheck) return res.status(400).json({ error: "Invalid phone (not AR canonical)" });
+      if (!convIdForCheck) {
+        return res.status(400).json({ error: "Invalid phone (not AR canonical)" });
+      }
 
       const convSnap = await db.collection("conversations").doc(convIdForCheck).get();
       if (!convSnap.exists) {
@@ -351,7 +381,7 @@ export default async function handler(req, res) {
       }
 
       const dataConv = convSnap.data() || {};
-      const marketingOptInValue = dataConv.marketingOptIn; // true|false|undefined
+      const marketingOptInValue = dataConv.marketingOptIn;
       const optIn = dataConv.optIn === true;
 
       if (marketingOptInValue === false) {
@@ -361,7 +391,9 @@ export default async function handler(req, res) {
         });
       }
 
-      const allowed = REQUIRE_MARKETING_OPTIN ? (marketingOptInValue === true) : (optIn === true);
+      const allowed = REQUIRE_MARKETING_OPTIN
+        ? marketingOptInValue === true
+        : optIn === true;
 
       if (!allowed) {
         return res.status(403).json({
@@ -385,7 +417,7 @@ export default async function handler(req, res) {
     for (const cand of cands) {
       const payload = {
         messaging_product: "whatsapp",
-        to: cand, // dígitos sin '+'
+        to: cand,
         type: "template",
         template: {
           name: tName,
@@ -418,7 +450,6 @@ export default async function handler(req, res) {
       }
 
       lastErr = data;
-      // 131030 (sandbox/whitelist) => probamos el otro candidato
       if (data?.error?.code !== 131030) break;
     }
 
@@ -435,6 +466,7 @@ export default async function handler(req, res) {
       const msgId = data?.messages?.[0]?.id || data?.message_id || null;
 
       const convId = canonicalConvIdAR(usedToDigits || toRaw);
+      const resolvedText = buildResolvedTextFromVars(tName, vars);
       const textPreview = previewFromVars(tName, vars);
 
       const convRef = db.collection("conversations").doc(convId);
@@ -462,7 +494,10 @@ export default async function handler(req, res) {
             language: lang,
             components: fixedComponents,
           },
-          vars, // ✅ para render exacto en front (ahora puede traer \n)
+          vars,
+          text: resolvedText,
+          resolvedText,
+          body: resolvedText,
           textPreview,
           businessPhoneId: PHONE_ID,
           timestamp: FieldValue.serverTimestamp(),
@@ -476,7 +511,6 @@ export default async function handler(req, res) {
       );
     } catch (e) {
       console.error("[OUT MSG SAVE] error:", e);
-      // no rompemos la respuesta si el guardado falla
     }
 
     return res.status(200).json({
