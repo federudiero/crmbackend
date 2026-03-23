@@ -25,7 +25,7 @@ const PRIVATE_VM_USERS = {
   },
   "laurialvarez456@gmail.com": {
     fallbackPhoneId: "987669861103912",
-    fallbackEnvKey: "META_WA_PHONE_ID_VM_LAURA",
+    fallbackEnvKey: "META_WA_PHONE_ID_1002",
     label: "Laura Alvarez",
   },
 };
