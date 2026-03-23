@@ -16,6 +16,20 @@ const DEFAULT_PHONE_ID = process.env.META_WA_PHONE_ID || "";
 const TOKEN = process.env.META_WA_TOKEN || "";
 const PREFER_5415 = String(process.env.META_WA_PREFER_5415 || "") === "1";
 
+// Casillas individuales de Villa María
+const PRIVATE_VM_USERS = {
+  "escalantefr.p@gmail.com": {
+    fallbackPhoneId: "721961900420098",
+    fallbackEnvKey: "META_WA_PHONE_ID_VM",
+    label: "Fernando Escalante",
+  },
+  "laurialvarez456@gmail.com": {
+    fallbackPhoneId: "987669861103912",
+    fallbackEnvKey: "META_WA_PHONE_ID_VM_LAURA",
+    label: "Laura Alvarez",
+  },
+};
+
 // ---------- helpers de números (AR) ----------
 const digits = (s) => String(s || "").replace(/\D+/g, "");
 
@@ -73,21 +87,80 @@ async function sendToGraph(phoneId, toDigits, payload) {
   return { ok: res.ok, status: res.status, json };
 }
 
-// ---------- resolver emisor ----------
-async function resolvePhoneIdFor(db, toRaw, explicitPhoneId, defaultPhoneId) {
-  if (explicitPhoneId) return explicitPhoneId;
+// ---------- resolver privado VM ----------
+async function resolvePrivateVmPhoneId(db, senderUid, senderEmail) {
+  const email = String(senderEmail || "").trim().toLowerCase();
+  const cfg = PRIVATE_VM_USERS[email] || null;
+  if (!cfg) return null;
 
+  // 1) users/{uid}.waPhoneId
+  try {
+    const snap = await db.collection("users").doc(String(senderUid || "")).get();
+    if (snap.exists) {
+      const waPhoneId = String(snap.data()?.waPhoneId || "").trim();
+      if (waPhoneId) {
+        return { phoneId: waPhoneId, source: "users.waPhoneId" };
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 2) env específica
+  if (cfg.fallbackEnvKey && process.env[cfg.fallbackEnvKey]) {
+    return {
+      phoneId: process.env[cfg.fallbackEnvKey],
+      source: "private-env-fallback",
+    };
+  }
+
+  // 3) hardcoded fallback
+  if (cfg.fallbackPhoneId) {
+    return {
+      phoneId: cfg.fallbackPhoneId,
+      source: "private-hardcoded-fallback",
+    };
+  }
+
+  return null;
+}
+
+// ---------- resolver emisor ----------
+async function resolvePhoneIdFor(
+  db,
+  toRaw,
+  explicitPhoneId,
+  defaultPhoneId,
+  senderUid,
+  senderEmail
+) {
+  // 1) si vino explícito, manda eso
+  if (explicitPhoneId) {
+    return { phoneId: explicitPhoneId, source: "explicit" };
+  }
+
+  // 2) mantener lógica actual: responder por el número por donde entró el cliente
   const convId = normalizeE164AR(toRaw);
   if (convId) {
     try {
       const snap = await db.collection("conversations").doc(convId).get();
       const fromConv = snap.exists ? snap.data()?.lastInboundPhoneId : null;
-      if (fromConv) return fromConv;
+      if (fromConv) {
+        return { phoneId: fromConv, source: "conversation.lastInboundPhoneId" };
+      }
     } catch {
       /* ignore */
     }
   }
-  return defaultPhoneId;
+
+  // 3) Villa María: si no hubo inbound en la conv, usar número propio del usuario
+  const privateVm = await resolvePrivateVmPhoneId(db, senderUid, senderEmail);
+  if (privateVm?.phoneId) {
+    return privateVm;
+  }
+
+  // 4) fallback final
+  return { phoneId: defaultPhoneId, source: "default" };
 }
 
 // ---------- helper preview ----------
@@ -154,12 +227,16 @@ export default async function handler(req, res) {
     }
 
     const senderUid = decoded?.uid || null;
-    const senderEmail = (decoded?.email || "").toLowerCase();
+    const senderEmail = String(decoded?.email || "").trim().toLowerCase();
 
     // Body robusto
     let body = req.body;
     if (typeof body === "string") {
-      try { body = JSON.parse(body || "{}"); } catch { body = {}; }
+      try {
+        body = JSON.parse(body || "{}");
+      } catch {
+        body = {};
+      }
     } else if (!body || typeof body !== "object") {
       body = {};
     }
@@ -186,19 +263,44 @@ export default async function handler(req, res) {
     const results = [];
 
     for (const raw of recipients) {
-      const PHONE_ID = await resolvePhoneIdFor(db, raw, (fromWaPhoneId || phoneId), DEFAULT_PHONE_ID);
-      if (!PHONE_ID) return res.status(500).json({ error: "no_phone_id_available" });
+      const resolvedPhone = await resolvePhoneIdFor(
+        db,
+        raw,
+        fromWaPhoneId || phoneId,
+        DEFAULT_PHONE_ID,
+        senderUid,
+        senderEmail
+      );
+
+      const PHONE_ID = resolvedPhone?.phoneId || "";
+      const phoneSource = resolvedPhone?.source || "unknown";
+
+      if (!PHONE_ID) {
+        return res.status(500).json({ error: "no_phone_id_available" });
+      }
 
       const cands = candidatesForSendAR(raw);
-      let delivered = null, usedToDigits = null, usedVariant = null, lastErr = null;
+      let delivered = null;
+      let usedToDigits = null;
+      let usedVariant = null;
+      let lastErr = null;
 
       for (const cand of cands) {
         let payload;
+
         if (image) payload = { type: "image", image };
         else if (audio) payload = { type: "audio", audio };
         else if (document) payload = { type: "document", document };
         else if (template) payload = { type: "template", template };
-        else payload = { type: "text", text: { body: typeof text === "string" ? text : (text?.body || ""), preview_url: false } };
+        else {
+          payload = {
+            type: "text",
+            text: {
+              body: typeof text === "string" ? text : (text?.body || ""),
+              preview_url: false,
+            },
+          };
+        }
 
         const ctxId = replyTo?.wamid || replyTo?.id;
         if (ctxId) payload.context = { message_id: String(ctxId) };
@@ -210,6 +312,7 @@ export default async function handler(req, res) {
           usedVariant = cand.startsWith("549") ? "549" : "5415";
           break;
         }
+
         lastErr = r.json;
         if (r?.json?.error?.code !== 131030) break;
       }
@@ -217,10 +320,21 @@ export default async function handler(req, res) {
       const convId = normalizeE164AR(usedToDigits || cands[0]);
       const convRef = db.collection("conversations").doc(convId);
 
-      await convRef.set({ contactId: convId, lastMessageAt: FieldValue.serverTimestamp() }, { merge: true });
+      await convRef.set(
+        { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
 
       const wamid = delivered?.messages?.[0]?.id || `out_${Date.now()}`;
-      const sentType = image ? "image" : audio ? "audio" : document ? "document" : (template ? "template" : "text");
+      const sentType = image
+        ? "image"
+        : audio
+        ? "audio"
+        : document
+        ? "document"
+        : template
+        ? "template"
+        : "text";
 
       const msgDoc = {
         direction: "out",
@@ -230,6 +344,7 @@ export default async function handler(req, res) {
         toRawSent: usedToDigits ? `+${usedToDigits}` : undefined,
         sendVariant: usedVariant || undefined,
         businessPhoneId: PHONE_ID,
+        businessPhoneSource: phoneSource,
         status: delivered ? "sent" : "error",
         raw: delivered || undefined,
         error: delivered ? undefined : (lastErr || { message: "send_failed" }),
@@ -270,7 +385,9 @@ export default async function handler(req, res) {
           } else {
             const parts = comps.map((x) => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
             const label = msgDoc?.template?.name || "template";
-            msgDoc.textPreview = parts.length ? `[Plantilla ${label}] ${parts.join(" • ")}` : `[Plantilla ${label}]`;
+            msgDoc.textPreview = parts.length
+              ? `[Plantilla ${label}] ${parts.join(" • ")}`
+              : `[Plantilla ${label}]`;
           }
         } catch {
           const label = msgDoc?.template?.name || "template";
@@ -345,6 +462,7 @@ export default async function handler(req, res) {
         ok: !!delivered,
         id: wamid,
         phoneId: PHONE_ID,
+        phoneSource,
         sendVariant: msgDoc.sendVariant,
         error: msgDoc.error,
       });

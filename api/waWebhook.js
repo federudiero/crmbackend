@@ -132,7 +132,7 @@ function pickAreaAssignee({ e164, display }) {
   let map = {};
   try {
     map = JSON.parse(raw);
-  } catch { }
+  } catch {}
 
   if (!s.startsWith("+549")) return null;
 
@@ -153,6 +153,28 @@ function pickAreaAssignee({ e164, display }) {
     name: out.name || out.email || null,
     area: best,
   };
+}
+
+/** --- Casillas privadas por número entrante --- */
+const PRIVATE_WA_OWNERS = {
+  "721961900420098": {
+    uid: "XQz6IqmJTTU3WdxlZgFI4MrAktj1",
+    email: "escalantefr.p@gmail.com",
+    name: "Fernando Escalante",
+  },
+  "987669861103912": {
+    uid: "xRrAzEJlBVWFzWhXZjl9agbUDp73",
+    email: "laurialvarez456@gmail.com",
+    name: "Laura Alvarez",
+  },
+};
+
+function pickPrivateOwnerByPhoneId(phoneId) {
+  const id = String(phoneId || "").trim();
+  if (!id) return null;
+  const out = PRIVATE_WA_OWNERS[id];
+  if (!out?.uid) return null;
+  return out;
 }
 
 /** Descarga metadata + binario del media de WhatsApp (con reintentos rápidos) */
@@ -250,7 +272,8 @@ async function fetchUrlMedia(url, retryCount = 0) {
     String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
 
   console.log(
-    `🔍 [fetchUrlMedia] url=${String(url).slice(0, 120)}... intento ${retryCount + 1
+    `🔍 [fetchUrlMedia] url=${String(url).slice(0, 120)}... intento ${
+      retryCount + 1
     }/${MAX_RETRIES + 1}`
   );
 
@@ -440,8 +463,28 @@ export default async function handler(req, res) {
 
         tx.set(convRef, stripUndefined(baseConv), { merge: true });
 
-        // auto-asignación por área (solo si no tiene dueño)
-        if (!hasOwner) {
+        // 1) Casillas privadas: SIEMPRE ganan por número entrante
+        const privateOwner = pickPrivateOwnerByPhoneId(phoneId);
+
+        if (privateOwner?.uid) {
+          const assignPayload = {
+            assignedToUid: privateOwner.uid,
+            ...(privateOwner.name ? { assignedToName: privateOwner.name } : {}),
+            ...(privateOwner.email ? { assignedToEmail: privateOwner.email } : {}),
+            assignedAt: now,
+          };
+
+          tx.set(convRef, stripUndefined(assignPayload), { merge: true });
+
+          console.log("Auto-asignada por número privado", {
+            convId,
+            phoneId,
+            to: privateOwner.uid,
+            email: privateOwner.email || null,
+          });
+        }
+        // 2) Córdoba / resto: mantener lógica actual
+        else if (!hasOwner) {
           const route = pickAreaAssignee({
             e164: convId,
             display: phoneDisplay || null,
@@ -512,7 +555,7 @@ export default async function handler(req, res) {
           const mediaType = String(r.media_type || "").toLowerCase();
           const wantsVideoDownload =
             String(process.env.DOWNLOAD_AD_VIDEO || "").toLowerCase() ===
-            "true" || String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
+              "true" || String(process.env.DOWNLOAD_AD_VIDEO || "") === "1";
 
           let savedImage = null;
           let savedThumb = null;
@@ -843,7 +886,7 @@ export default async function handler(req, res) {
                 orig?.from || (orig?.direction === "out" ? "agent" : "client");
               replyTo.createdAt = orig?.timestamp || null;
             }
-          } catch { }
+          } catch {}
 
           messageData.replyTo = stripUndefined(replyTo);
         }
@@ -950,8 +993,16 @@ export default async function handler(req, res) {
                 ? `
                   <hr style="border:none;border-top:1px solid #e5e7eb;margin:14px 0" />
                   <p><strong>Origen: Anuncio</strong></p>
-                  ${cleanMessage.referral.headline ? `<p><b>Título:</b> ${String(cleanMessage.referral.headline).replace(/</g, "&lt;")}</p>` : ""}
-                  ${cleanMessage.referral.body ? `<p><b>Texto:</b> ${String(cleanMessage.referral.body).replace(/</g, "&lt;")}</p>` : ""}
+                  ${
+                    cleanMessage.referral.headline
+                      ? `<p><b>Título:</b> ${String(cleanMessage.referral.headline).replace(/</g, "&lt;")}</p>`
+                      : ""
+                  }
+                  ${
+                    cleanMessage.referral.body
+                      ? `<p><b>Texto:</b> ${String(cleanMessage.referral.body).replace(/</g, "&lt;")}</p>`
+                      : ""
+                  }
                   ${adImg ? `<p><img src="${adImg}" alt="Anuncio" style="max-width:420px;border-radius:10px" /></p>` : ""}
                 `
                 : "";

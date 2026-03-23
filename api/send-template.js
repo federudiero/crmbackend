@@ -33,6 +33,21 @@ const EMAIL_TO_ENV = {
   "christian15366@gmail.com": "META_WA_PHONE_ID_0453",
   "julicisneros.89@gmail.com": "META_WA_PHONE_ID_8148",
   "lunacami00@gmail.com": "META_WA_PHONE_ID",
+  "escalantefr.p@gmail.com": "META_WA_PHONE_ID_VM",
+  "laurialvarez456@gmail.com": "META_WA_PHONE_ID_1002",
+};
+
+const PRIVATE_VM_USERS = {
+  "escalantefr.p@gmail.com": {
+    fallbackPhoneId: "721961900420098",
+    fallbackEnvKey: "META_WA_PHONE_ID_VM",
+    label: "Fernando Escalante",
+  },
+  "laurialvarez456@gmail.com": {
+    fallbackPhoneId: "987669861103912",
+    fallbackEnvKey: "META_WA_PHONE_ID_1002",
+    label: "Laura Alvarez",
+  },
 };
 
 // ====== helpers números (AR) ======
@@ -53,7 +68,7 @@ function normalizeE164AR(raw) {
     return `+549${area}${local}`;
   }
 
-  // si viene 54... sin 15, lo dejamos +54... (ojo: no siempre es canónico, pero es AR)
+  // si viene 54... sin 15, lo dejamos +54...
   if (d.startsWith("54")) return `+${d}`;
 
   // si viene con 00
@@ -62,7 +77,6 @@ function normalizeE164AR(raw) {
   // si viene con 0 adelante
   d = d.replace(/^0+/, "");
 
-  // NO inventamos país acá; si no es 54, no es AR canónico
   return `+${d}`;
 }
 
@@ -209,7 +223,7 @@ function buildResolvedTextFromVars(tName, vars) {
 
     let out = header;
     if (promos.length) out += `\n\n${promos.join("\n")}`;
-    out += "\n\n¿Querés que te reserve alguno?`"
+    out += "\n\n¿Querés que te reserve alguno?";
 
     return out.trim();
   }
@@ -233,7 +247,7 @@ function previewFromVars(tName, vars) {
 function setCors(req, res) {
   const raw = String(
     process.env.ALLOWED_ORIGIN ||
-    "https://crmhogarcril.com,http://localhost:5173,http://localhost:5174"
+      "https://crmhogarcril.com,http://localhost:5173,http://localhost:5174"
   );
 
   const allowed = raw
@@ -293,29 +307,76 @@ export default async function handler(req, res) {
 
     const db = getFirestore();
     const uid = decoded.uid;
-    const email = (decoded.email || "").toLowerCase();
+    const email = (decoded.email || "").toLowerCase().trim();
 
-    // ── Resolver PHONE_ID por seller
+    // ── Resolver PHONE_ID
     let phoneEnvKey = null;
-    try {
-      const docSnap = await db.collection("sellers").doc(uid).get();
-      if (docSnap.exists) phoneEnvKey = docSnap.data()?.phoneEnvKey || null;
-    } catch { }
+    let PHONE_ID = null;
+    let phoneSource = null;
 
-    if (!phoneEnvKey && email) phoneEnvKey = EMAIL_TO_ENV[email] || "META_WA_PHONE_ID";
+    // 1) Villa María: primero resolver por users/{uid}.waPhoneId
+    const privateVmCfg = PRIVATE_VM_USERS[email] || null;
 
-    const PHONE_ID =
-      (phoneEnvKey && process.env[phoneEnvKey]) ||
-      process.env.META_WA_PHONE_ID ||
-      process.env.META_WA_PHONE_ID_0453 ||
-      process.env.META_WA_PHONE_ID_8148;
+    if (privateVmCfg) {
+      try {
+        const userDoc = await db.collection("users").doc(uid).get();
+        if (userDoc.exists) {
+          const waPhoneId = String(userDoc.data()?.waPhoneId || "").trim();
+          if (waPhoneId) {
+            PHONE_ID = waPhoneId;
+            phoneSource = "users.waPhoneId";
+          }
+        }
+      } catch (e) {
+        console.error("[send-template] users/{uid} lookup failed:", e?.message || e);
+      }
+
+      // fallback 1: env específica de Villa María
+      if (!PHONE_ID && privateVmCfg.fallbackEnvKey && process.env[privateVmCfg.fallbackEnvKey]) {
+        phoneEnvKey = privateVmCfg.fallbackEnvKey;
+        PHONE_ID = process.env[privateVmCfg.fallbackEnvKey];
+        phoneSource = "private-env-fallback";
+      }
+
+      // fallback 2: hardcode del phoneId real
+      if (!PHONE_ID && privateVmCfg.fallbackPhoneId) {
+        phoneEnvKey = privateVmCfg.fallbackEnvKey || null;
+        PHONE_ID = privateVmCfg.fallbackPhoneId;
+        phoneSource = "private-hardcoded-fallback";
+      }
+    }
+
+    // 2) Córdoba / resto: mantener lógica actual
+    if (!PHONE_ID) {
+      try {
+        const docSnap = await db.collection("sellers").doc(uid).get();
+        if (docSnap.exists) phoneEnvKey = docSnap.data()?.phoneEnvKey || null;
+      } catch (e) {
+        console.error("[send-template] sellers/{uid} lookup failed:", e?.message || e);
+      }
+
+      if (!phoneEnvKey && email) {
+        phoneEnvKey = EMAIL_TO_ENV[email] || "META_WA_PHONE_ID";
+      }
+
+      PHONE_ID =
+        (phoneEnvKey && process.env[phoneEnvKey]) ||
+        process.env.META_WA_PHONE_ID ||
+        process.env.META_WA_PHONE_ID_0453 ||
+        process.env.META_WA_PHONE_ID_8148;
+
+      if (PHONE_ID && !phoneSource) {
+        phoneSource = phoneEnvKey ? "seller-env" : "default-env";
+      }
+    }
 
     const TOKEN = process.env.META_WA_TOKEN;
 
     if (!PHONE_ID || !TOKEN) {
-      return res
-        .status(500)
-        .json({ error: `Missing PHONE_ID (${phoneEnvKey || "null"}) or META_WA_TOKEN` });
+      return res.status(500).json({
+        error: `Missing PHONE_ID (${phoneEnvKey || "null"}) or META_WA_TOKEN`,
+        seller: { uid, email },
+      });
     }
 
     // ── Body (acepta payload viejo y nuevo)
@@ -344,8 +405,8 @@ export default async function handler(req, res) {
       Array.isArray(input?.components) && input.components.length
         ? input.components
         : Array.isArray(tplObj?.components) && tplObj.components.length
-          ? tplObj.components
-          : [];
+        ? tplObj.components
+        : [];
 
     // ====== Normalizar components/body/params ======
     const norm = (incomingComponents || []).map((c) => ({
@@ -528,8 +589,8 @@ export default async function handler(req, res) {
             language: lang,
             components: fixedComponents,
           },
-          vars,        // para mostrar en CRM
-          metaVars,    // lo que se mandó realmente a Meta
+          vars, // para mostrar en CRM
+          metaVars, // lo que se mandó realmente a Meta
           text: resolvedText,
           resolvedText,
           body: resolvedText,
@@ -556,6 +617,7 @@ export default async function handler(req, res) {
       seller_uid: uid,
       seller_email: email,
       phoneEnvKey,
+      phoneSource,
     });
   } catch (err) {
     const status = err?.statusCode || 500;
