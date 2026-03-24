@@ -417,7 +417,12 @@ export default async function handler(req, res) {
       await db.runTransaction(async (tx) => {
         const snap = await tx.get(convRef);
         const isNew = !snap.exists;
-        const hasOwner = !!snap.get("assignedToUid");
+
+        const currentAssignedUid = String(snap.get("assignedToUid") || "").trim();
+        const currentAssignedEmail = String(snap.get("assignedToEmail") || "")
+          .trim()
+          .toLowerCase();
+        const hasOwner = !!currentAssignedUid || !!currentAssignedEmail;
 
         const now = FieldValue.serverTimestamp();
 
@@ -463,25 +468,35 @@ export default async function handler(req, res) {
 
         tx.set(convRef, stripUndefined(baseConv), { merge: true });
 
-        // 1) Casillas privadas: SIEMPRE ganan por número entrante
+        // 1) Casillas privadas: solo toman chats nuevos o sin asignar
         const privateOwner = pickPrivateOwnerByPhoneId(phoneId);
 
         if (privateOwner?.uid) {
-          const assignPayload = {
-            assignedToUid: privateOwner.uid,
-            ...(privateOwner.name ? { assignedToName: privateOwner.name } : {}),
-            ...(privateOwner.email ? { assignedToEmail: privateOwner.email } : {}),
-            assignedAt: now,
-          };
+          if (isNew || !hasOwner) {
+            const assignPayload = {
+              assignedToUid: privateOwner.uid,
+              ...(privateOwner.name ? { assignedToName: privateOwner.name } : {}),
+              ...(privateOwner.email ? { assignedToEmail: privateOwner.email } : {}),
+              assignedAt: now,
+            };
 
-          tx.set(convRef, stripUndefined(assignPayload), { merge: true });
+            tx.set(convRef, stripUndefined(assignPayload), { merge: true });
 
-          console.log("Auto-asignada por número privado", {
-            convId,
-            phoneId,
-            to: privateOwner.uid,
-            email: privateOwner.email || null,
-          });
+            console.log("Auto-asignada por número privado", {
+              convId,
+              phoneId,
+              to: privateOwner.uid,
+              email: privateOwner.email || null,
+              reason: isNew ? "new-conversation" : "unassigned-conversation",
+            });
+          } else {
+            console.log("Chat privado entrante conservó asignación existente", {
+              convId,
+              phoneId,
+              currentAssignedToUid: currentAssignedUid || null,
+              currentAssignedToEmail: currentAssignedEmail || null,
+            });
+          }
         }
         // 2) Córdoba / resto: mantener lógica actual
         else if (!hasOwner) {
