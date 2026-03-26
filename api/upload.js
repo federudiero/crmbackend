@@ -24,18 +24,32 @@ const send = (res, status, body = {}) =>
 
 // ===== Constantes =====
 const MB = 1024 * 1024;
-const MAX_INPUT_BYTES = 25 * MB; // límite de entrada del backend
-const MAX_IMAGE_BYTES = 5 * MB;  // WhatsApp imagen
-const MAX_AUDIO_BYTES = 16 * MB; // WhatsApp audio
-const MAX_DOC_BYTES = 25 * MB;   // conservamos tu límite actual
+const MAX_INPUT_BYTES = 25 * MB;
+const MAX_IMAGE_BYTES = 5 * MB;
+const MAX_AUDIO_BYTES = 16 * MB;
+const MAX_DOC_BYTES = 25 * MB;
+const MIN_AUDIO_BYTES = 1024;
 
-function safeBaseName(name = "upload") {
+function makeHttpError(message, statusCode = 400, code = "bad_request", details = null) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  err.code = code;
+  err.details = details;
+  return err;
+}
+
+function baseMime(mime = "") {
+  return String(mime || "").toLowerCase().split(";")[0].trim();
+}
+
+function safeBaseStem(name = "upload") {
   const ext = path.extname(name);
   const base = path.basename(name, ext);
   return (base || "upload").replace(/[^\w.-]+/g, "_");
 }
 
 function extForMime(mime = "") {
+  const m = baseMime(mime);
   const map = {
     "image/jpeg": "jpg",
     "image/png": "png",
@@ -43,9 +57,12 @@ function extForMime(mime = "") {
     "audio/mpeg": "mp3",
     "audio/mp4": "m4a",
     "audio/amr": "amr",
+    "audio/wav": "wav",
+    "audio/aac": "aac",
+    "audio/webm": "webm",
     "application/pdf": "pdf",
   };
-  return map[mime] || "bin";
+  return map[m] || "bin";
 }
 
 async function cleanupFiles(paths = []) {
@@ -96,13 +113,13 @@ function readMultipartFile(req) {
 
       file.on("limit", () => {
         rejected = true;
-        reject(new Error("Archivo demasiado grande (>25MB)"));
+        reject(makeHttpError("Archivo demasiado grande (>25MB)", 413, "file_too_large"));
       });
     });
 
     bb.on("finish", () => {
       if (rejected) return;
-      if (!gotFile) return reject(new Error("archivo faltante"));
+      if (!gotFile) return reject(makeHttpError("archivo faltante", 400, "missing_file"));
 
       resolve({
         conversationId,
@@ -118,7 +135,7 @@ function readMultipartFile(req) {
 }
 
 // ===== Audio conversion =====
-async function transcodeToOggOpus(inputBuffer, inputExt = "bin") {
+async function transcodeToMp3(inputBuffer, inputExt = "bin") {
   if (!ffmpegPath) {
     throw new Error(
       "ffmpeg-static no está disponible. Instalá la dependencia y redeployá el backend."
@@ -127,27 +144,27 @@ async function transcodeToOggOpus(inputBuffer, inputExt = "bin") {
 
   const id = crypto.randomUUID();
   const inPath = path.join(os.tmpdir(), `${id}.${inputExt || "bin"}`);
-  const outPath = path.join(os.tmpdir(), `${id}.ogg`);
+  const outPath = path.join(os.tmpdir(), `${id}.mp3`);
 
   try {
     await fs.writeFile(inPath, inputBuffer);
 
     await new Promise((resolve, reject) => {
       const args = [
+        "-v",
+        "error",
         "-y",
         "-i",
         inPath,
         "-vn",
         "-ac",
-        "1",         // mono
+        "1",
         "-ar",
-        "48000",
+        "44100",
         "-c:a",
-        "libopus",
+        "libmp3lame",
         "-b:a",
-        "64k",
-        "-f",
-        "ogg",
+        "96k",
         outPath,
       ];
 
@@ -161,17 +178,11 @@ async function transcodeToOggOpus(inputBuffer, inputExt = "bin") {
         stderr += d.toString();
       });
 
-      proc.on("error", (err) => {
-        reject(err);
-      });
+      proc.on("error", reject);
 
       proc.on("close", (code) => {
         if (code === 0) return resolve();
-        reject(
-          new Error(
-            stderr?.trim() || `ffmpeg terminó con código ${code}`
-          )
-        );
+        reject(new Error(stderr?.trim() || `ffmpeg terminó con código ${code}`));
       });
     });
 
@@ -185,12 +196,9 @@ async function transcodeToOggOpus(inputBuffer, inputExt = "bin") {
 async function normalizeUpload({ buffer, filename, clientMime }) {
   const sniffed = await fileTypeFromBuffer(buffer).catch(() => null);
 
-  const sniffMime = String(sniffed?.mime || "").toLowerCase();
+  const sniffMime = baseMime(sniffed?.mime || "");
   const sniffExt = String(sniffed?.ext || "").toLowerCase();
-  const declaredMime = String(clientMime || "")
-    .toLowerCase()
-    .split(";")[0]
-    .trim();
+  const declaredMime = baseMime(clientMime);
   const originalExt = path.extname(filename || "").replace(".", "").toLowerCase();
 
   const isPdf =
@@ -205,19 +213,21 @@ async function normalizeUpload({ buffer, filename, clientMime }) {
   const isAudio =
     declaredMime.startsWith("audio/") ||
     sniffMime.startsWith("audio/") ||
-    (originalExt === "webm" && declaredMime === "audio/webm") ||
-    (sniffMime === "video/webm" && declaredMime === "audio/webm");
+    sniffMime.startsWith("video/") ||
+    ["webm", "ogg", "oga", "wav", "aac", "mp3", "m4a", "amr"].includes(originalExt);
 
   if (!isPdf && !isImage && !isAudio) {
-    throw new Error(
-      `Tipo no permitido. declared=${declaredMime || "?"} sniffed=${sniffMime || "?"}`
+    throw makeHttpError(
+      `Tipo no permitido. declared=${declaredMime || "?"} sniffed=${sniffMime || "?"}`,
+      415,
+      "unsupported_media_type"
     );
   }
 
   // ---------- PDF ----------
   if (isPdf) {
     if (buffer.length > MAX_DOC_BYTES) {
-      throw new Error("PDF > 25MB");
+      throw makeHttpError("PDF > 25MB", 413, "pdf_too_large");
     }
 
     return {
@@ -237,10 +247,13 @@ async function normalizeUpload({ buffer, filename, clientMime }) {
         ? sniffMime
         : declaredMime;
 
-    // WhatsApp imagen normal: jpeg/png
     if (effectiveImageMime === "image/jpeg" || effectiveImageMime === "image/png") {
       if (buffer.length > MAX_IMAGE_BYTES) {
-        throw new Error("La imagen supera 5MB, WhatsApp la va a rechazar");
+        throw makeHttpError(
+          "La imagen supera 5MB, WhatsApp la va a rechazar",
+          413,
+          "image_too_large"
+        );
       }
 
       return {
@@ -253,7 +266,6 @@ async function normalizeUpload({ buffer, filename, clientMime }) {
       };
     }
 
-    // webp/heic/gif/etc => jpeg
     const jpgBuffer = await sharp(buffer, { animated: false })
       .rotate()
       .jpeg({
@@ -263,7 +275,11 @@ async function normalizeUpload({ buffer, filename, clientMime }) {
       .toBuffer();
 
     if (jpgBuffer.length > MAX_IMAGE_BYTES) {
-      throw new Error("La imagen convertida supera 5MB, WhatsApp la va a rechazar");
+      throw makeHttpError(
+        "La imagen convertida supera 5MB, WhatsApp la va a rechazar",
+        413,
+        "image_too_large_after_conversion"
+      );
     }
 
     return {
@@ -277,8 +293,14 @@ async function normalizeUpload({ buffer, filename, clientMime }) {
   }
 
   // ---------- Audio ----------
-  // Dejamos pasar MP3 / M4A.
-  // Todo lo demás lo normalizamos a OGG/OPUS mono para Meta.
+  if (buffer.length < MIN_AUDIO_BYTES) {
+    throw makeHttpError(
+      "El audio llegó vacío o incompleto. Grabalo de nuevo.",
+      422,
+      "invalid_audio_input"
+    );
+  }
+
   const sourceAudioMime =
     declaredMime === "audio/webm"
       ? "audio/webm"
@@ -286,34 +308,64 @@ async function normalizeUpload({ buffer, filename, clientMime }) {
       ? "audio/webm"
       : sniffMime || declaredMime || "application/octet-stream";
 
-  const passthroughAudio = new Set(["audio/mpeg", "audio/mp4"]);
-
-  if (passthroughAudio.has(sourceAudioMime)) {
+  if (sourceAudioMime === "audio/mpeg") {
     if (buffer.length > MAX_AUDIO_BYTES) {
-      throw new Error("El audio supera 16MB, WhatsApp lo va a rechazar");
+      throw makeHttpError(
+        "El audio supera 16MB, WhatsApp lo va a rechazar",
+        413,
+        "audio_too_large"
+      );
     }
 
     return {
       buffer,
-      contentType: sourceAudioMime,
-      ext: extForMime(sourceAudioMime),
+      contentType: "audio/mpeg",
+      ext: "mp3",
       converted: false,
       originalContentType: declaredMime || sourceAudioMime,
       detectedContentType: sniffMime || sourceAudioMime,
     };
   }
 
-  const inputExt = originalExt || sniffExt || "bin";
-  const oggBuffer = await transcodeToOggOpus(buffer, inputExt);
+  const inputExt = originalExt || sniffExt || extForMime(sourceAudioMime) || "bin";
 
-  if (oggBuffer.length > MAX_AUDIO_BYTES) {
-    throw new Error("El audio convertido supera 16MB, WhatsApp lo va a rechazar");
+  let mp3Buffer;
+  try {
+    mp3Buffer = await transcodeToMp3(buffer, inputExt);
+  } catch (e) {
+    throw makeHttpError(
+      "No se pudo procesar el audio grabado. Probá grabarlo de nuevo.",
+      422,
+      "invalid_audio_input",
+      {
+        declaredMime,
+        detectedMime: sniffMime,
+        originalExt,
+        ffmpeg: String(e?.message || "").slice(0, 1200),
+      }
+    );
+  }
+
+  if (!mp3Buffer?.length || mp3Buffer.length < MIN_AUDIO_BYTES) {
+    throw makeHttpError(
+      "El audio convertido quedó vacío o incompleto.",
+      422,
+      "invalid_audio_output"
+    );
+  }
+
+  if (mp3Buffer.length > MAX_AUDIO_BYTES) {
+    throw makeHttpError(
+      "El audio convertido supera 16MB, WhatsApp lo va a rechazar",
+      413,
+      "audio_too_large_after_conversion"
+    );
   }
 
   return {
-    buffer: oggBuffer,
-    contentType: "audio/ogg",
-    ext: "ogg",
+    buffer: mp3Buffer,
+    contentType: "audio/mpeg",
+    ext: "mp3",
     converted: true,
     originalContentType: declaredMime || sourceAudioMime,
     detectedContentType: sniffMime || declaredMime || sourceAudioMime,
@@ -329,7 +381,7 @@ export default async function handler(req, res) {
 
   try {
     if (!bucket?.name) {
-      throw new Error("Bucket not available");
+      throw makeHttpError("Bucket not available", 500, "bucket_unavailable");
     }
 
     const { conversationId, filename, mime, buffer } = await readMultipartFile(req);
@@ -348,8 +400,8 @@ export default async function handler(req, res) {
       clientMime: mime,
     });
 
-    const baseName = safeBaseName(filename || "upload");
-    const finalName = `${Date.now()}_${baseName}.${normalized.ext}`;
+    const baseStem = safeBaseStem(filename || "upload");
+    const finalName = `${Date.now()}_${baseStem}.${normalized.ext}`;
     const objectPath = `public/conversations/${conversationId}/${finalName}`;
 
     const file = bucket.file(objectPath);
@@ -387,9 +439,11 @@ export default async function handler(req, res) {
     });
   } catch (err) {
     console.error("upload error:", err);
-    return send(res, 500, {
+    return send(res, Number(err?.statusCode || 500), {
       ok: false,
       error: err?.message || "Upload failed",
+      code: err?.code || "upload_failed",
+      details: err?.details || null,
     });
   }
 }
