@@ -2,7 +2,7 @@
 
 // ====== CORS ======
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*",
+  "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*", // en prod poné tu dominio
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
@@ -27,38 +27,38 @@ const PRIVATE_VM_USERS = {
   },
   "laurialvarez456@gmail.com": {
     fallbackPhoneId: "987669861103912",
-    fallbackEnvKey: "META_WA_PHONE_ID_10",
+    fallbackEnvKey: "META_WA_PHONE_ID_1002",
     label: "Laura Alvarez",
   },
 };
 
-function onlyDigits(v) {
-  return String(v || "").replace(/\D+/g, "");
-}
+// ---------- helpers de números (AR) ----------
+const digits = (s) => String(s || "").replace(/\D+/g, "");
 
 function normalizeE164AR(raw) {
-  const d = onlyDigits(raw);
+  let d = digits(raw);
   if (!d) return "";
   if (d.startsWith("549")) return `+${d}`;
-  if (/^54\d{2,4}15\d+$/.test(d)) {
-    const m = d.match(/^54(\d{2,4})15(\d+)$/);
-    if (m) return `+549${m[1]}${m[2]}`;
+  const m5415 = d.match(/^54(\d{2,4})15(\d+)$/);
+  if (m5415) {
+    const [, area, local] = m5415;
+    return `+549${area}${local}`;
   }
   if (d.startsWith("54")) return `+${d}`;
-  if (d.startsWith("9")) return `+54${d}`;
-  if (d.startsWith("0")) return `+54${d.slice(1)}`;
-  return `+549${d}`;
+  if (d.startsWith("00")) d = d.slice(2);
+  d = d.replace(/^0+/, "");
+  return `+${d}`;
 }
 
-function candidatesForSendAR(raw) {
-  const d0 = onlyDigits(raw);
-  if (!d0) return [];
+function candidatesForSendAR(toRaw) {
+  const d0 = digits(toRaw);
 
-  if (d0.startsWith("549")) {
-    const rest = d0.slice(3);
-    const area = rest.length === 10 ? rest.slice(0, 2) : rest.slice(0, 3);
-    const local = rest.slice(area.length);
-    return PREFER_5415 ? [`54${area}15${local}`, d0] : [d0, `54${area}15${local}`];
+  if (/^549\d+$/.test(d0)) {
+    const areaLocal = d0.slice(3);
+    const m = areaLocal.match(/^(\d{2,4})(\d+)$/);
+    if (!m) return [d0];
+    const [, area, rest] = m;
+    return PREFER_5415 ? [`54${area}15${rest}`, d0] : [d0, `54${area}15${rest}`];
   }
 
   const m5415 = d0.match(/^54(\d{2,4})15(\d+)$/);
@@ -95,6 +95,7 @@ async function resolvePrivateVmPhoneId(db, senderUid, senderEmail) {
   const cfg = PRIVATE_VM_USERS[email] || null;
   if (!cfg) return null;
 
+  // 1) users/{uid}.waPhoneId
   try {
     const snap = await db.collection("users").doc(String(senderUid || "")).get();
     if (snap.exists) {
@@ -107,6 +108,7 @@ async function resolvePrivateVmPhoneId(db, senderUid, senderEmail) {
     // ignore
   }
 
+  // 2) env específica
   if (cfg.fallbackEnvKey && process.env[cfg.fallbackEnvKey]) {
     return {
       phoneId: process.env[cfg.fallbackEnvKey],
@@ -114,6 +116,7 @@ async function resolvePrivateVmPhoneId(db, senderUid, senderEmail) {
     };
   }
 
+  // 3) hardcoded fallback
   if (cfg.fallbackPhoneId) {
     return {
       phoneId: cfg.fallbackPhoneId,
@@ -133,10 +136,12 @@ async function resolvePhoneIdFor(
   senderUid,
   senderEmail
 ) {
+  // 1) si vino explícito, manda eso
   if (explicitPhoneId) {
     return { phoneId: explicitPhoneId, source: "explicit" };
   }
 
+  // 2) mantener lógica actual: responder por el número por donde entró el cliente
   const convId = normalizeE164AR(toRaw);
   if (convId) {
     try {
@@ -150,11 +155,13 @@ async function resolvePhoneIdFor(
     }
   }
 
+  // 3) Villa María: si no hubo inbound en la conv, usar número propio del usuario
   const privateVm = await resolvePrivateVmPhoneId(db, senderUid, senderEmail);
   if (privateVm?.phoneId) {
     return privateVm;
   }
 
+  // 4) fallback final
   return { phoneId: defaultPhoneId, source: "default" };
 }
 
@@ -200,7 +207,7 @@ async function assertTemplateEligibility(db, rawPhone) {
 // ---------- helper preview ----------
 function buildPreviewForSent({ sentType, text, template, image, audio, document }) {
   if (sentType === "text") {
-    return typeof text === "string" ? text : text?.body || "";
+    return typeof text === "string" ? text : (text?.body || "");
   }
 
   if (sentType === "template") {
@@ -243,10 +250,12 @@ export default async function handler(req, res) {
   try {
     if (!TOKEN) return res.status(500).json({ error: "server_misconfigured" });
 
+    // Import dinámico
     const fb = await import("../lib/firebaseAdmin.js");
     const admin = fb.default;
     const { db, FieldValue } = fb;
 
+    // ✅ Auth Firebase (obligatorio)
     const authH = req.headers.authorization || "";
     const idToken = authH.startsWith("Bearer ") ? authH.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: "Missing Bearer token" });
@@ -261,6 +270,7 @@ export default async function handler(req, res) {
     const senderUid = decoded?.uid || null;
     const senderEmail = String(decoded?.email || "").trim().toLowerCase();
 
+    // Body robusto
     let body = req.body;
     if (typeof body === "string") {
       try {
@@ -283,7 +293,7 @@ export default async function handler(req, res) {
       fromWaPhoneId,
       phoneId,
       replyTo,
-      sellerName,
+      sellerName, // opcional
     } = body;
 
     if (!to) return res.status(400).json({ error: "missing_to" });
@@ -340,7 +350,7 @@ export default async function handler(req, res) {
           payload = {
             type: "text",
             text: {
-              body: typeof text === "string" ? text : text?.body || "",
+              body: typeof text === "string" ? text : (text?.body || ""),
               preview_url: false,
             },
           };
@@ -391,15 +401,16 @@ export default async function handler(req, res) {
         businessPhoneSource: phoneSource,
         status: delivered ? "sent" : "error",
         raw: delivered || undefined,
-        error: delivered ? undefined : lastErr || { message: "send_failed" },
+        error: delivered ? undefined : (lastErr || { message: "send_failed" }),
 
+        // ✅ Auditoría
         sentByUid: senderUid || undefined,
         sentByEmail: senderEmail || undefined,
         sellerName: sellerName || undefined,
       };
 
       if (sentType === "text") {
-        msgDoc.text = typeof text === "string" ? text : text?.body || "";
+        msgDoc.text = typeof text === "string" ? text : (text?.body || "");
       }
 
       if (sentType === "template") {
@@ -523,14 +534,10 @@ export default async function handler(req, res) {
       });
     }
 
-    return res.status(200).json({
-      ok: results.every((x) => x.ok),
-      results,
-    });
-  } catch (e) {
-    console.error("sendMessage error:", e);
-    return res.status(500).json({
-      error: e?.message || "send_failed",
-    });
+    return res.status(200).json({ ok: results.every((r) => r.ok), results });
+  } catch (err) {
+    setCors(res);
+    console.error("sendMessage error:", err);
+    return res.status(500).json({ error: err.message || "internal_error" });
   }
 }
