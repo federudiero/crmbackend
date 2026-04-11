@@ -1,5 +1,6 @@
 import admin from "../lib/firebaseAdmin.js";
 import { getFirestore } from "firebase-admin/firestore";
+import { normalizeE164AR, resolveConversationContext } from "../lib/conversationScope.js";
 
 const PREFER_5415 = String(process.env.META_WA_PREFER_5415 || "") === "1";
 const REQUIRE_MARKETING_OPTIN =
@@ -47,29 +48,8 @@ async function readJson(req) {
   }
 }
 
-const digits = (s) => String(s || "").replace(/\D+/g, "");
-
-function normalizeE164AR(raw) {
-  let d = digits(raw);
-  if (!d) return "";
-
-  if (d.startsWith("549")) return `+${d}`;
-
-  const m5415 = d.match(/^54(\d{2,4})15(\d+)$/);
-  if (m5415) {
-    const [, area, local] = m5415;
-    return `+549${area}${local}`;
-  }
-
-  if (d.startsWith("54")) return `+${d}`;
-  if (d.startsWith("00")) d = d.slice(2);
-  d = d.replace(/^0+/, "");
-
-  return d ? `+${d}` : "";
-}
-
 function candidatesForSendAR(toRaw) {
-  const d0 = digits(toRaw);
+  const d0 = String(toRaw || "").replace(/\D+/g, "");
 
   if (/^549\d+$/.test(d0)) {
     const areaLocal = d0.slice(3);
@@ -95,20 +75,6 @@ function candidatesForSendAR(toRaw) {
   const v549 = `549${area}${local}`;
   const v5415 = `54${area}15${local}`;
   return PREFER_5415 ? [v5415, v549] : [v549, v5415];
-}
-
-function canonicalConvIdAR(raw) {
-  const direct = normalizeE164AR(raw);
-  if (direct && direct.startsWith("+54")) return direct;
-
-  const cands = candidatesForSendAR(raw);
-  for (const cand of cands) {
-    const n = normalizeE164AR(cand);
-    if (n && n.startsWith("+549")) return n;
-    if (n) return n;
-  }
-
-  return "";
 }
 
 function toIsoOrNull(value) {
@@ -197,8 +163,8 @@ export default async function handler(req, res) {
       });
     }
 
-    const convId = canonicalConvIdAR(phoneRaw);
-    if (!convId) {
+    const normalizedPhone = normalizeE164AR(phoneRaw);
+    if (!normalizedPhone) {
       return res.status(400).json({
         ok: false,
         canSend: false,
@@ -214,9 +180,14 @@ export default async function handler(req, res) {
     }
 
     const db = getFirestore();
-    const convSnap = await db.collection("conversations").doc(convId).get();
+    const ctx = await resolveConversationContext(db, {
+      conversationId: String(input?.conversationId || "").trim(),
+      rawPhone: normalizedPhone,
+      phoneId: String(input?.fromWaPhoneId || input?.phoneId || "").trim(),
+      preferScopedId: false,
+    });
 
-    if (!convSnap.exists) {
+    if (!ctx?.data) {
       return res.status(200).json({
         ok: true,
         canSend: false,
@@ -224,8 +195,8 @@ export default async function handler(req, res) {
         reason: "No existe conversación previa para ese número en Firestore.",
         phone: {
           raw: String(phoneRaw),
-          normalized: normalizeE164AR(phoneRaw),
-          convId,
+          normalized: normalizedPhone,
+          convId: ctx?.conversationId || null,
           candidates: candidatesForSendAR(phoneRaw),
         },
         policy: {
@@ -236,7 +207,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const dataConv = convSnap.data() || {};
+    const dataConv = ctx.data || {};
     const eligibility = buildEligibility(dataConv);
 
     return res.status(200).json({
@@ -245,7 +216,7 @@ export default async function handler(req, res) {
       phone: {
         raw: String(phoneRaw),
         normalized: normalizeE164AR(phoneRaw),
-        convId,
+        convId: ctx?.conversationId || null,
         candidates: candidatesForSendAR(phoneRaw),
       },
       policy: {
@@ -254,7 +225,8 @@ export default async function handler(req, res) {
       },
       conversation: {
         exists: true,
-        contactId: dataConv.contactId || convId,
+        contactId: dataConv.contactId || normalizedPhone,
+        conversationId: ctx?.conversationId || null,
         optIn: dataConv.optIn === true,
         marketingOptIn: dataConv.marketingOptIn,
         lastInboundAt: toIsoOrNull(dataConv.lastInboundAt),

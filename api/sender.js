@@ -12,19 +12,57 @@ const EMAIL_TO_ENV = {
   "laurialvarez456@gmail.com": "META_WA_PHONE_ID_1002",
 };
 
-// Casillas individuales de Villa María
-const PRIVATE_VM_USERS = {
-  "escalantefr.p@gmail.com": {
-    fallbackPhoneId: "721961900420098",
-    fallbackEnvKey: "META_WA_PHONE_ID_VM",
-    label: "Fernando Escalante",
-  },
-  "laurialvarez456@gmail.com": {
-    fallbackPhoneId: "987669861103912",
-    fallbackEnvKey: "META_WA_PHONE_ID_1002",
-    label: "Laura Alvarez",
-  },
-};
+async function getUserWaPhoneId(db, uid) {
+  try {
+    const userDoc = await db.collection("users").doc(String(uid || "")).get();
+    if (!userDoc.exists) return "";
+    return String(userDoc.data()?.waPhoneId || "").trim();
+  } catch (e) {
+    console.error("[sender] users/{uid}.waPhoneId lookup failed:", e?.message || e);
+    return "";
+  }
+}
+
+async function resolveGeneralPhoneId(db, uid, email) {
+  let phoneEnvKey = null;
+
+  try {
+    const sellerDoc = await db.collection("sellers").doc(String(uid || "")).get();
+    if (sellerDoc.exists) {
+      phoneEnvKey = String(sellerDoc.data()?.phoneEnvKey || "").trim() || null;
+    }
+  } catch (e) {
+    console.error("[sender] sellers/{uid} lookup failed:", e?.message || e);
+  }
+
+  if (!phoneEnvKey && email) {
+    phoneEnvKey = EMAIL_TO_ENV[email] || null;
+  }
+
+  if (phoneEnvKey && process.env[phoneEnvKey]) {
+    return {
+      phoneId: process.env[phoneEnvKey],
+      phoneEnvKey,
+      source: "seller-env",
+    };
+  }
+
+  const waPhoneId = await getUserWaPhoneId(db, uid);
+  if (waPhoneId) {
+    return {
+      phoneId: waPhoneId,
+      phoneEnvKey: null,
+      source: "users.waPhoneId",
+    };
+  }
+
+  const fallbackPhoneId = process.env.META_WA_PHONE_ID || null;
+  return {
+    phoneId: fallbackPhoneId,
+    phoneEnvKey,
+    source: fallbackPhoneId ? "default-env" : "default-missing",
+  };
+}
 
 export default async function handler(req, res) {
   try {
@@ -55,89 +93,10 @@ export default async function handler(req, res) {
     const uid = String(decoded.uid || "");
     const email = String(decoded.email || "").trim().toLowerCase();
 
-    let phoneEnvKey = null;
-    let phoneId = null;
-    let source = null;
-
-    // --------------------------------------------------
-    // 1) Villa María: primero resolver por users/{uid}.waPhoneId
-    //    para que Fernando y Laura usen SIEMPRE su número propio.
-    // --------------------------------------------------
-    const privateVmCfg = PRIVATE_VM_USERS[email] || null;
-
-    if (privateVmCfg) {
-      try {
-        const userDoc = await db.collection("users").doc(uid).get();
-        if (userDoc.exists) {
-          const waPhoneId = String(userDoc.data()?.waPhoneId || "").trim();
-          if (waPhoneId) {
-            phoneId = waPhoneId;
-            source = "users.waPhoneId";
-          }
-        }
-      } catch (e) {
-        console.error("[sender] users/{uid} lookup failed:", e?.message || e);
-      }
-
-      // fallback 1: env específica de Villa María
-      if (!phoneId && privateVmCfg.fallbackEnvKey && process.env[privateVmCfg.fallbackEnvKey]) {
-        phoneEnvKey = privateVmCfg.fallbackEnvKey;
-        phoneId = process.env[privateVmCfg.fallbackEnvKey];
-        source = "private-env-fallback";
-      }
-
-      // fallback 2: hardcode del phoneId real
-      if (!phoneId && privateVmCfg.fallbackPhoneId) {
-        phoneEnvKey = privateVmCfg.fallbackEnvKey || null;
-        phoneId = privateVmCfg.fallbackPhoneId;
-        source = "private-hardcoded-fallback";
-      }
-    }
-
-    // --------------------------------------------------
-    // 2) Córdoba / resto: mantener lógica actual
-    // --------------------------------------------------
-    if (!phoneId) {
-      try {
-        const sellerDoc = await db.collection("sellers").doc(uid).get();
-        if (sellerDoc.exists) {
-          phoneEnvKey = sellerDoc.data()?.phoneEnvKey || null;
-        }
-      } catch (e) {
-        console.error("[sender] sellers/{uid} lookup failed:", e?.message || e);
-      }
-
-      if (!phoneEnvKey && email) {
-        phoneEnvKey = EMAIL_TO_ENV[email] || "META_WA_PHONE_ID";
-      }
-
-      phoneId =
-        (phoneEnvKey && process.env[phoneEnvKey]) ||
-        process.env.META_WA_PHONE_ID ||
-        null;
-
-      if (phoneId && !source) {
-        source = phoneEnvKey ? "seller-env" : "default-env";
-      }
-    }
-
-    // --------------------------------------------------
-    // 3) Último fallback: users/{uid}.waPhoneId para cualquier otro caso
-    // --------------------------------------------------
-    if (!phoneId) {
-      try {
-        const userDoc = await db.collection("users").doc(uid).get();
-        if (userDoc.exists) {
-          const waPhoneId = String(userDoc.data()?.waPhoneId || "").trim();
-          if (waPhoneId) {
-            phoneId = waPhoneId;
-            source = "users.waPhoneId-fallback";
-          }
-        }
-      } catch (e) {
-        console.error("[sender] final users/{uid} fallback failed:", e?.message || e);
-      }
-    }
+    const resolved = await resolveGeneralPhoneId(db, uid, email);
+    const phoneEnvKey = resolved.phoneEnvKey || null;
+    const phoneId = resolved.phoneId || null;
+    const source = resolved.source || null;
 
     if (!phoneId) {
       return res.status(404).json({

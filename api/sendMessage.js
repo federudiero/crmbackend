@@ -1,5 +1,13 @@
 // backend/api/sendMessage.js
 
+import {
+  buildContactDocIds,
+  buildScopedConversationId,
+  digits,
+  normalizeE164AR,
+  resolveConversationContext,
+} from "../lib/conversationScope.js";
+
 // ====== CORS ======
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": process.env.CORS_ORIGIN || "*", // en prod poné tu dominio
@@ -18,38 +26,16 @@ const PREFER_5415 = String(process.env.META_WA_PREFER_5415 || "") === "1";
 const REQUIRE_MARKETING_OPTIN =
   String(process.env.REQUIRE_MARKETING_OPTIN || "0") === "1";
 
-// Casillas individuales de Villa María
-const PRIVATE_VM_USERS = {
-  "escalantefr.p@gmail.com": {
-    fallbackPhoneId: "721961900420098",
-    fallbackEnvKey: "META_WA_PHONE_ID_VM",
-    label: "Fernando Escalante",
-  },
-  "laurialvarez456@gmail.com": {
-    fallbackPhoneId: "987669861103912",
-    fallbackEnvKey: "META_WA_PHONE_ID_1002",
-    label: "Laura Alvarez",
-  },
+// Resolver phone id por seller
+const EMAIL_TO_ENV = {
+  "christian15366@gmail.com": "META_WA_PHONE_ID_0453",
+  "julicisneros.89@gmail.com": "META_WA_PHONE_ID_8148",
+  "lunacami00@gmail.com": "META_WA_PHONE_ID",
+  "escalantefr.p@gmail.com": "META_WA_PHONE_ID_VM",
+  "laurialvarez456@gmail.com": "META_WA_PHONE_ID_1002",
 };
 
 // ---------- helpers de números (AR) ----------
-const digits = (s) => String(s || "").replace(/\D+/g, "");
-
-function normalizeE164AR(raw) {
-  let d = digits(raw);
-  if (!d) return "";
-  if (d.startsWith("549")) return `+${d}`;
-  const m5415 = d.match(/^54(\d{2,4})15(\d+)$/);
-  if (m5415) {
-    const [, area, local] = m5415;
-    return `+549${area}${local}`;
-  }
-  if (d.startsWith("54")) return `+${d}`;
-  if (d.startsWith("00")) d = d.slice(2);
-  d = d.replace(/^0+/, "");
-  return `+${d}`;
-}
-
 function candidatesForSendAR(toRaw) {
   const d0 = digits(toRaw);
 
@@ -89,149 +75,234 @@ async function sendToGraph(phoneId, toDigits, payload) {
   return { ok: res.ok, status: res.status, json };
 }
 
-// ---------- resolver privado VM ----------
-async function resolvePrivateVmPhoneId(db, senderUid, senderEmail) {
-  const email = String(senderEmail || "").trim().toLowerCase();
-  const cfg = PRIVATE_VM_USERS[email] || null;
-  if (!cfg) return null;
-
-  // 1) users/{uid}.waPhoneId
+async function getUserWaPhoneId(db, senderUid) {
   try {
     const snap = await db.collection("users").doc(String(senderUid || "")).get();
+    if (!snap.exists) return "";
+    return String(snap.data()?.waPhoneId || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function resolveSellerPhoneId(db, senderUid, senderEmail, defaultPhoneId) {
+  const email = String(senderEmail || "").trim().toLowerCase();
+  let phoneEnvKey = null;
+
+  try {
+    const snap = await db.collection("sellers").doc(String(senderUid || "")).get();
     if (snap.exists) {
-      const waPhoneId = String(snap.data()?.waPhoneId || "").trim();
-      if (waPhoneId) {
-        return { phoneId: waPhoneId, source: "users.waPhoneId" };
-      }
+      phoneEnvKey = String(snap.data()?.phoneEnvKey || "").trim() || null;
     }
   } catch {
     // ignore
   }
 
-  // 2) env específica
-  if (cfg.fallbackEnvKey && process.env[cfg.fallbackEnvKey]) {
+  if (!phoneEnvKey && email) {
+    phoneEnvKey = EMAIL_TO_ENV[email] || null;
+  }
+
+  if (phoneEnvKey && process.env[phoneEnvKey]) {
     return {
-      phoneId: process.env[cfg.fallbackEnvKey],
-      source: "private-env-fallback",
+      phoneId: process.env[phoneEnvKey],
+      source: "seller-env",
+      phoneEnvKey,
     };
   }
 
-  // 3) hardcoded fallback
-  if (cfg.fallbackPhoneId) {
+  const waPhoneId = await getUserWaPhoneId(db, senderUid);
+  if (waPhoneId) {
     return {
-      phoneId: cfg.fallbackPhoneId,
-      source: "private-hardcoded-fallback",
+      phoneId: waPhoneId,
+      source: "users.waPhoneId",
+      phoneEnvKey: null,
     };
   }
 
-  return null;
+  return {
+    phoneId: defaultPhoneId || "",
+    source: defaultPhoneId ? "default-env" : "default-missing",
+    phoneEnvKey,
+  };
 }
 
 // ---------- resolver emisor ----------
 async function resolvePhoneIdFor(
   db,
-  toRaw,
-  explicitPhoneId,
-  defaultPhoneId,
-  senderUid,
-  senderEmail
+  { toRaw, conversationId, explicitPhoneId, defaultPhoneId, senderUid, senderEmail }
 ) {
-  // 1) si vino explícito, manda eso
   if (explicitPhoneId) {
-    return { phoneId: explicitPhoneId, source: "explicit" };
+    const ctx = await resolveConversationContext(db, {
+      conversationId,
+      rawPhone: toRaw,
+      phoneId: explicitPhoneId,
+      preferScopedId: true,
+    });
+
+    return {
+      phoneId: explicitPhoneId,
+      source: "explicit",
+      phoneEnvKey: null,
+      normalizedPhone: ctx?.normalizedPhone || normalizeE164AR(toRaw),
+      conversationId: ctx?.conversationId || buildScopedConversationId(toRaw, explicitPhoneId),
+      conversationData: ctx?.data || null,
+    };
   }
 
-  // 2) mantener lógica actual: responder por el número por donde entró el cliente
-  const convId = normalizeE164AR(toRaw);
-  if (convId) {
-    try {
-      const snap = await db.collection("conversations").doc(convId).get();
-      const fromConv = snap.exists ? snap.data()?.lastInboundPhoneId : null;
-      if (fromConv) {
-        return { phoneId: fromConv, source: "conversation.lastInboundPhoneId" };
-      }
-    } catch {
-      /* ignore */
-    }
+  const ctx = await resolveConversationContext(db, {
+    conversationId,
+    rawPhone: toRaw,
+    preferScopedId: false,
+  });
+
+  const fromConversation = String(
+    ctx?.data?.lastInboundPhoneId ||
+      ctx?.data?.scopedPhoneNumberId ||
+      ctx?.data?.businessPhoneId ||
+      ""
+  ).trim();
+
+  if (fromConversation) {
+    return {
+      phoneId: fromConversation,
+      source: "conversation.phoneId",
+      phoneEnvKey: null,
+      normalizedPhone: ctx?.normalizedPhone || normalizeE164AR(toRaw),
+      conversationId: ctx?.conversationId || buildScopedConversationId(toRaw, fromConversation),
+      conversationData: ctx?.data || null,
+    };
   }
 
-  // 3) Villa María: si no hubo inbound en la conv, usar número propio del usuario
-  const privateVm = await resolvePrivateVmPhoneId(db, senderUid, senderEmail);
-  if (privateVm?.phoneId) {
-    return privateVm;
-  }
+  const sellerResolved = await resolveSellerPhoneId(db, senderUid, senderEmail, defaultPhoneId);
+  const sellerPhoneId = sellerResolved?.phoneId || "";
+  const sellerCtx = await resolveConversationContext(db, {
+    conversationId,
+    rawPhone: toRaw,
+    phoneId: sellerPhoneId,
+    preferScopedId: true,
+  });
 
-  // 4) fallback final
-  return { phoneId: defaultPhoneId, source: "default" };
+  return {
+    ...sellerResolved,
+    normalizedPhone: sellerCtx?.normalizedPhone || normalizeE164AR(toRaw),
+    conversationId:
+      sellerCtx?.conversationId || buildScopedConversationId(toRaw, sellerPhoneId),
+    conversationData: sellerCtx?.data || null,
+  };
 }
 
 // ---------- elegibilidad para templates ----------
-async function assertTemplateEligibility(db, rawPhone) {
-  const convId = normalizeE164AR(rawPhone);
-  if (!convId) {
+async function assertTemplateEligibility(db, { rawPhone, conversationId = "", phoneId = "" }) {
+  const ctx = await resolveConversationContext(db, {
+    conversationId,
+    rawPhone,
+    phoneId,
+    preferScopedId: false,
+  });
+
+  const normalizedPhone = ctx?.normalizedPhone || normalizeE164AR(rawPhone);
+  if (!normalizedPhone) {
     const err = new Error("invalid_phone_for_template_check");
     err.statusCode = 400;
     throw err;
   }
 
-  const snap = await db.collection("conversations").doc(convId).get();
-  if (!snap.exists) {
+  if (!ctx?.data) {
     const err = new Error("conversation_not_found_for_optin_check");
     err.statusCode = 404;
     throw err;
   }
 
-  const data = snap.data() || {};
+  const data = ctx.data || {};
   const optIn = data.optIn === true;
   const marketingOptIn = data.marketingOptIn;
 
   if (marketingOptIn === false) {
     const err = new Error("contact_opted_out_of_marketing");
     err.statusCode = 403;
-    err.details = { optIn, marketingOptIn };
+    err.details = { optIn, marketingOptIn, conversationId: ctx.conversationId };
     throw err;
   }
 
-  const allowed = REQUIRE_MARKETING_OPTIN
-    ? marketingOptIn === true
-    : optIn === true;
+  const allowed = REQUIRE_MARKETING_OPTIN ? marketingOptIn === true : optIn === true;
 
   if (!allowed) {
     const err = new Error("contact_not_opted_in_for_marketing");
     err.statusCode = 403;
-    err.details = { optIn, marketingOptIn, REQUIRE_MARKETING_OPTIN };
+    err.details = {
+      optIn,
+      marketingOptIn,
+      REQUIRE_MARKETING_OPTIN,
+      conversationId: ctx.conversationId,
+    };
     throw err;
   }
 }
 
-// ---------- helper preview ----------
+// ---------- helpers template text ----------
+function stripZWSP(value) {
+  const x = String(value ?? "");
+  return x === "​" ? "" : x;
+}
+
+function getTemplateBodyParams(template) {
+  const comps = Array.isArray(template?.components) ? template.components : [];
+  const bodyComp =
+    comps.find((c) => String(c?.type || "").toLowerCase() === "body") || comps[0] || null;
+
+  return Array.isArray(bodyComp?.parameters) ? bodyComp.parameters : [];
+}
+
+function buildResolvedTemplateText(template) {
+  try {
+    const params = getTemplateBodyParams(template);
+    const parts = params
+      .map((x) => stripZWSP(typeof x?.text === "string" ? x.text : ""))
+      .filter(Boolean);
+
+    const p = (i) => stripZWSP(typeof params[i]?.text === "string" ? params[i].text : "");
+    const name = String(template?.name || "").trim();
+    const lowerName = name.toLowerCase();
+    const envReengage = String(
+      process.env.VITE_WA_REENGAGE_TEMPLATE || "reengage_free_text"
+    ).toLowerCase();
+    const brandName = String(process.env.VITE_BRAND_NAME || "HogarCril").trim();
+    const isReengage = lowerName === envReengage || lowerName === "reengage_free_text";
+
+    if (isReengage) {
+      const client = p(0);
+      const seller = p(1);
+      const freeText = p(2);
+
+      if (freeText && freeText.toLowerCase() !== brandName.toLowerCase()) {
+        return freeText.trim();
+      }
+
+      const hello = client ? `Hola ${client}` : "Hola";
+      const sellerPart = seller ? `, soy ${seller}` : "";
+      const brandPart = brandName ? ` de ${brandName}` : "";
+      return `${hello}${sellerPart}${brandPart}.`.trim();
+    }
+
+    return parts.length
+      ? `[Plantilla ${name || "template"}] ${parts.join(" • ")}`
+      : `[Plantilla ${name || "template"}]`;
+  } catch {
+    return `[Plantilla ${template?.name || "template"}]`;
+  }
+}
+
 function buildPreviewForSent({ sentType, text, template, image, audio, document }) {
   if (sentType === "text") {
     return typeof text === "string" ? text : (text?.body || "");
   }
 
   if (sentType === "template") {
-    try {
-      const comps = Array.isArray(template?.components) ? template.components : [];
-      const params = comps?.[0]?.parameters || [];
-      const p = (i) => (typeof params[i]?.text === "string" ? params[i].text : "");
-
-      const name = String(template?.name || "").toLowerCase();
-      const envReengage = (process.env.VITE_WA_REENGAGE_TEMPLATE || "reengage_free_text").toLowerCase();
-      const isReengage = name === envReengage || name === "reengage_free_text";
-
-      if (isReengage) {
-        const p1 = p(0) || "¡Hola!";
-        const p2 = p(1) || "Equipo de Ventas";
-        const p3 = p(2) || "Tu Comercio";
-        return `¡Hola ${p1}! Soy ${p2} de ${p3}.`;
-      }
-
-      const parts = params.map((x) => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
-      return parts.length ? `[Plantilla ${template?.name}] ${parts.join(" • ")}` : `[Plantilla ${template?.name}]`;
-    } catch {
-      return `[Plantilla ${template?.name || "enviada"}]`;
-    }
+    const resolved = buildResolvedTemplateText(template);
+    return String(resolved || "")
+      .replace(/\n+/g, " • ")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim();
   }
 
   if (sentType === "image") return image?.caption || "[Imagen]";
@@ -290,6 +361,7 @@ export default async function handler(req, res) {
       audio,
       audioMeta,
       document,
+      conversationId,
       fromWaPhoneId,
       phoneId,
       replyTo,
@@ -305,9 +377,34 @@ export default async function handler(req, res) {
     const results = [];
 
     for (const raw of recipients) {
+      const resolvedPhone = await resolvePhoneIdFor(db, {
+        toRaw: raw,
+        conversationId,
+        explicitPhoneId: fromWaPhoneId || phoneId,
+        defaultPhoneId: DEFAULT_PHONE_ID,
+        senderUid,
+        senderEmail,
+      });
+
+      const PHONE_ID = resolvedPhone?.phoneId || "";
+      const phoneSource = resolvedPhone?.source || "unknown";
+      const targetPhone = resolvedPhone?.normalizedPhone || normalizeE164AR(raw);
+
+      if (!PHONE_ID) {
+        return res.status(500).json({ error: "no_phone_id_available" });
+      }
+
+      if (!targetPhone) {
+        return res.status(400).json({ error: "invalid_to_phone", to: raw });
+      }
+
       if (template) {
         try {
-          await assertTemplateEligibility(db, raw);
+          await assertTemplateEligibility(db, {
+            rawPhone: targetPhone,
+            conversationId,
+            phoneId: PHONE_ID,
+          });
         } catch (e) {
           return res.status(e.statusCode || 403).json({
             error: e.message || "template_optin_validation_failed",
@@ -317,23 +414,7 @@ export default async function handler(req, res) {
         }
       }
 
-      const resolvedPhone = await resolvePhoneIdFor(
-        db,
-        raw,
-        fromWaPhoneId || phoneId,
-        DEFAULT_PHONE_ID,
-        senderUid,
-        senderEmail
-      );
-
-      const PHONE_ID = resolvedPhone?.phoneId || "";
-      const phoneSource = resolvedPhone?.source || "unknown";
-
-      if (!PHONE_ID) {
-        return res.status(500).json({ error: "no_phone_id_available" });
-      }
-
-      const cands = candidatesForSendAR(raw);
+      const cands = candidatesForSendAR(targetPhone);
       let delivered = null;
       let usedToDigits = null;
       let usedVariant = null;
@@ -371,11 +452,32 @@ export default async function handler(req, res) {
         if (r?.json?.error?.code !== 131030) break;
       }
 
-      const convId = normalizeE164AR(usedToDigits || cands[0]);
+      const normalizedPhone = normalizeE164AR(usedToDigits || cands[0] || targetPhone);
+      const convId =
+        resolvedPhone?.conversationId || buildScopedConversationId(normalizedPhone, PHONE_ID);
       const convRef = db.collection("conversations").doc(convId);
 
+      const contactDocIds = buildContactDocIds({ conversationId: convId, normalizedPhone });
+      const baseContactData = {
+        phone: normalizedPhone,
+        waId: digits(normalizedPhone),
+        conversationId: convId,
+        scopedPhoneNumberId: PHONE_ID,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      for (const contactDocId of contactDocIds) {
+        await db.collection("contacts").doc(contactDocId).set(baseContactData, { merge: true });
+      }
+
       await convRef.set(
-        { contactId: convId, lastMessageAt: FieldValue.serverTimestamp() },
+        {
+          contactId: normalizedPhone,
+          clientPhone: normalizedPhone,
+          conversationId: convId,
+          scopedPhoneNumberId: PHONE_ID,
+          businessPhoneId: PHONE_ID,
+          lastMessageAt: FieldValue.serverTimestamp(),
+        },
         { merge: true }
       );
 
@@ -394,7 +496,7 @@ export default async function handler(req, res) {
         direction: "out",
         type: sentType,
         timestamp: FieldValue.serverTimestamp(),
-        to: convId,
+        to: normalizedPhone,
         toRawSent: usedToDigits ? `+${usedToDigits}` : undefined,
         sendVariant: usedVariant || undefined,
         businessPhoneId: PHONE_ID,
@@ -420,33 +522,19 @@ export default async function handler(req, res) {
           components: Array.isArray(template?.components) ? template.components : [],
         };
 
-        try {
-          const name = String(msgDoc?.template?.name || "").toLowerCase();
-          const envReengage = (process.env.VITE_WA_REENGAGE_TEMPLATE || "reengage_free_text").toLowerCase();
-          const isReengage = name === envReengage || name === "reengage_free_text";
+        const vars = getTemplateBodyParams(msgDoc.template).map((x) =>
+          typeof x?.text === "string" ? x.text : ""
+        );
+        const resolvedText = buildResolvedTemplateText(msgDoc.template);
 
-          const comps = msgDoc.template.components?.[0]?.parameters || [];
-          const p = (i) => (typeof comps[i]?.text === "string" ? comps[i].text : "");
-
-          if (isReengage) {
-            const p1 = p(0) || "¡Hola!";
-            const p2 = p(1) || "Equipo de Ventas";
-            const p3 = p(2) || "Tu Comercio";
-            msgDoc.textPreview =
-              `¡Hola ${p1}! Soy ${p2} de ${p3}.\n` +
-              `Te escribo para retomar tu consulta ya que pasaron más de 24 horas desde el último mensaje.\n` +
-              `Respondé a este mensaje para continuar la conversación.`;
-          } else {
-            const parts = comps.map((x) => (typeof x?.text === "string" ? x.text : "")).filter(Boolean);
-            const label = msgDoc?.template?.name || "template";
-            msgDoc.textPreview = parts.length
-              ? `[Plantilla ${label}] ${parts.join(" • ")}`
-              : `[Plantilla ${label}]`;
-          }
-        } catch {
-          const label = msgDoc?.template?.name || "template";
-          msgDoc.textPreview = `[Plantilla ${label}]`;
-        }
+        msgDoc.vars = vars;
+        msgDoc.text = resolvedText;
+        msgDoc.resolvedText = resolvedText;
+        msgDoc.body = resolvedText;
+        msgDoc.textPreview = buildPreviewForSent({
+          sentType: "template",
+          template: msgDoc.template,
+        });
       }
 
       if (sentType === "image") {
@@ -514,7 +602,11 @@ export default async function handler(req, res) {
 
       await convRef.set(
         {
-          contactId: convId,
+          contactId: normalizedPhone,
+          clientPhone: normalizedPhone,
+          conversationId: convId,
+          scopedPhoneNumberId: PHONE_ID,
+          businessPhoneId: PHONE_ID,
           lastMessageAt: FieldValue.serverTimestamp(),
           lastMessageText: String(preview || "").slice(0, 500),
           lastMessageDirection: "out",
@@ -525,6 +617,7 @@ export default async function handler(req, res) {
 
       results.push({
         to: convId,
+        phone: normalizedPhone,
         ok: !!delivered,
         id: wamid,
         phoneId: PHONE_ID,

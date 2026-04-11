@@ -1,5 +1,12 @@
 // api/waWebhook.js — webhook WhatsApp con media entrante robusto + replyTo en entrantes + EMAIL AL VENDEDOR
 import { db, FieldValue, bucket } from "../lib/firebaseAdmin.js";
+import {
+  buildContactDocIds,
+  buildScopedConversationId,
+  digits,
+  normalizeE164AR,
+  resolveConversationContext,
+} from "../lib/conversationScope.js";
 import { sendEmail } from "../lib/email.js";
 // import crypto from "crypto"; // (opcional) para firma webhook
 
@@ -17,36 +24,21 @@ function safeParseBody(req) {
   }
 }
 
-const digits = (s) => String(s || "").replace(/\D/g, "");
 
-// ✅ Normalización canónica (misma idea que send-template/sendMessage)
-// - Devuelve "" si no hay dígitos válidos
-// - Soporta prefijo 00 (internacional) y ceros de salida
-// - AR móvil canónico: +549XXXXXXXXXX
-// - AR legacy: +54 <area> 15 <local>  => +549<area><local>
-function normalizeE164AR(waIdOrPhone) {
-  // Canonical convId: +549XXXXXXXXXX (AR mobiles) or +<digits> for others
-  let d = digits(waIdOrPhone);
-  if (!d) return "";
+function getInboundProfileName(value, m, convId) {
+  const contacts = Array.isArray(value?.contacts) ? value.contacts : [];
+  if (!contacts.length) return "";
 
-  // handle prefixes like 00 (international) and trunk 0
-  if (d.startsWith("00")) d = d.slice(2);
-  d = d.replace(/^0+/, "");
+  const targetDigits = digits(convId || m?.from || "");
 
-  // Argentina mobile canonical
-  if (d.startsWith("549")) return `+${d}`;
-
-  // Argentina legacy: +54 <area> 15 <local>  => +549<area><local>
-  const m = d.match(/^54(\d{2,4})15(\d+)$/);
-  if (m) {
-    const [, area, local] = m;
-    return `+549${area}${local}`;
+  for (const c of contacts) {
+    const waIdDigits = digits(c?.wa_id || c?.input || "");
+    if (targetDigits && waIdDigits && waIdDigits === targetDigits) {
+      return String(c?.profile?.name || "").trim();
+    }
   }
 
-  // Generic E.164-ish
-  if (d.startsWith("54")) return `+${d}`;
-  if (d.length >= 8 && d.length <= 15) return `+${d}`;
-  return "";
+  return String(contacts[0]?.profile?.name || "").trim();
 }
 
 function extractTextFromMessage(m) {
@@ -155,26 +147,20 @@ function pickAreaAssignee({ e164, display }) {
   };
 }
 
-/** --- Casillas privadas por número entrante --- */
-const PRIVATE_WA_OWNERS = {
-  "721961900420098": {
-    uid: "XQz6IqmJTTU3WdxlZgFI4MrAktj1",
-    email: "escalantefr.p@gmail.com",
-    name: "Fernando Escalante",
-  },
-  "987669861103912": {
-    uid: "xRrAzEJlBVWFzWhXZjl9agbUDp73",
-    email: "laurialvarez456@gmail.com",
-    name: "Laura Alvarez",
-  },
-};
+/** --- Casillas compartidas con asignación manual --- */
+const SHARED_MANUAL_INBOX_PHONE_IDS = new Set([
+  // Córdoba
+  "807747825759387",
+  "729326663073216",
+  "834087939786971",
+  // Villa María
+  "721961900420098",
+  "987669861103912",
+]);
 
-function pickPrivateOwnerByPhoneId(phoneId) {
+function isSharedManualInboxPhone(phoneId) {
   const id = String(phoneId || "").trim();
-  if (!id) return null;
-  const out = PRIVATE_WA_OWNERS[id];
-  if (!out?.uid) return null;
-  return out;
+  return !!id && SHARED_MANUAL_INBOX_PHONE_IDS.has(id);
 }
 
 /** Descarga metadata + binario del media de WhatsApp (con reintentos rápidos) */
@@ -383,15 +369,18 @@ export default async function handler(req, res) {
 
     // ===== MENSAJES ENTRANTES =====
     for (const m of value.messages || []) {
-      const convId = normalizeE164AR(m.from);
+      const contactPhone = normalizeE164AR(m.from);
+      const convId = buildScopedConversationId(contactPhone, phoneId);
       const waMessageId = m.id;
       const tsSec = Number(m.timestamp || Math.floor(Date.now() / 1000));
       const eventTsMs = Number.isFinite(tsSec) ? tsSec * 1000 : Date.now();
       const text = extractTextFromMessage(m);
+      const inboundProfileName = getInboundProfileName(value, m, contactPhone);
 
-      if (!convId || !waMessageId) {
+      if (!contactPhone || !convId || !waMessageId) {
         console.warn("[waWebhook] skip message missing convId/waMessageId", {
           convId,
+          contactPhone,
           waMessageId,
         });
         continue;
@@ -400,18 +389,31 @@ export default async function handler(req, res) {
       const convRef = db.collection("conversations").doc(convId);
 
       // contact
-      const contactRef = db.collection("contacts").doc(convId);
-      const contactSnap = await contactRef.get();
+      const contactDocIds = buildContactDocIds({ conversationId: convId, normalizedPhone: contactPhone });
+      const contactSnap = await db.collection("contacts").doc(convId).get();
 
       const contactData = {
-        phone: convId,
-        waId: digits(convId),
+        phone: contactPhone,
+        waId: digits(contactPhone),
+        conversationId: convId,
+        scopedPhoneNumberId: phoneId || null,
         updatedAt: FieldValue.serverTimestamp(),
         optIn: true,
         optInAt: FieldValue.serverTimestamp(),
+        lastInboundPhoneId: phoneId || null,
+        ...(inboundProfileName
+          ? {
+              profileName: inboundProfileName,
+              name: inboundProfileName,
+              displayName: inboundProfileName,
+              lastInboundContactName: inboundProfileName,
+            }
+          : {}),
       };
       if (!contactSnap.exists) contactData.createdAt = FieldValue.serverTimestamp();
-      await contactRef.set(stripUndefined(contactData), { merge: true });
+      for (const contactDocId of contactDocIds) {
+        await db.collection("contacts").doc(contactDocId).set(stripUndefined(contactData), { merge: true });
+      }
 
       // conversation + auto-assign: ✅ transaction (evita carreras)
       await db.runTransaction(async (tx) => {
@@ -433,12 +435,23 @@ export default async function handler(req, res) {
         const shouldUpdateLastInbound = eventTsMs >= prevLastInboundTs;
 
         const baseConv = {
-          contactId: convId,
+          contactId: contactPhone,
+          clientPhone: contactPhone,
+          conversationId: convId,
+          scopedPhoneNumberId: phoneId || null,
 
           // inbound meta
           lastInboundPhoneId: phoneId || null,
           ...(phoneDisplay ? { lastInboundDisplayRaw: String(phoneDisplay) } : {}),
           ...(phoneDisplayE164 ? { lastInboundDisplay: phoneDisplayE164 } : {}),
+          ...(inboundProfileName
+            ? {
+                profileName: inboundProfileName,
+                displayName: inboundProfileName,
+                contactName: inboundProfileName,
+                lastInboundContactName: inboundProfileName,
+              }
+            : {}),
 
           // opt-in
           optIn: true,
@@ -468,40 +481,29 @@ export default async function handler(req, res) {
 
         tx.set(convRef, stripUndefined(baseConv), { merge: true });
 
-        // 1) Casillas privadas: solo toman chats nuevos o sin asignar
-        const privateOwner = pickPrivateOwnerByPhoneId(phoneId);
-
-        if (privateOwner?.uid) {
+        // 1) Casillas compartidas (Córdoba / Villa María): no auto-asignar.
+        if (isSharedManualInboxPhone(phoneId)) {
           if (isNew || !hasOwner) {
-            const assignPayload = {
-              assignedToUid: privateOwner.uid,
-              ...(privateOwner.name ? { assignedToName: privateOwner.name } : {}),
-              ...(privateOwner.email ? { assignedToEmail: privateOwner.email } : {}),
-              assignedAt: now,
-            };
-
-            tx.set(convRef, stripUndefined(assignPayload), { merge: true });
-
-            console.log("Auto-asignada por número privado", {
+            console.log("Inbox compartida con asignación manual", {
               convId,
+          contactPhone,
               phoneId,
-              to: privateOwner.uid,
-              email: privateOwner.email || null,
               reason: isNew ? "new-conversation" : "unassigned-conversation",
             });
           } else {
-            console.log("Chat privado entrante conservó asignación existente", {
+            console.log("Inbox compartida conservó asignación existente", {
               convId,
+          contactPhone,
               phoneId,
               currentAssignedToUid: currentAssignedUid || null,
               currentAssignedToEmail: currentAssignedEmail || null,
             });
           }
         }
-        // 2) Córdoba / resto: mantener lógica actual
+        // 2) Resto: mantener lógica actual de auto-ruteo por área
         else if (!hasOwner) {
           const route = pickAreaAssignee({
-            e164: convId,
+            e164: contactPhone,
             display: phoneDisplay || null,
           });
 
@@ -516,6 +518,7 @@ export default async function handler(req, res) {
 
             console.log("Auto-asignada por área", {
               convId,
+          contactPhone,
               area: route.area,
               to: route.uid,
             });
@@ -528,10 +531,15 @@ export default async function handler(req, res) {
         direction: "in",
         type: m.type || "text",
         text,
+        ...(inboundProfileName ? { profileName: inboundProfileName } : {}),
         timestamp: new Date(eventTsMs),
         businessPhoneId: phoneId,
         businessDisplay: phoneDisplay,
         raw: m,
+        rawWebhookSnapshot: {
+          contacts: Array.isArray(value?.contacts) ? value.contacts : [],
+          metadata: value?.metadata || null,
+        },
       };
 
       // =========================
@@ -584,6 +592,7 @@ export default async function handler(req, res) {
             } else if (file?.buf) {
               savedImage = await saveToStorageAndSign(
                 convId,
+          contactPhone,
                 `${waMessageId}_ad_image`,
                 file.mime,
                 file.buf
@@ -601,6 +610,7 @@ export default async function handler(req, res) {
               } else if (file?.buf) {
                 savedThumb = await saveToStorageAndSign(
                   convId,
+          contactPhone,
                   `${waMessageId}_ad_thumb`,
                   file.mime,
                   file.buf
@@ -616,6 +626,7 @@ export default async function handler(req, res) {
               } else if (file?.buf) {
                 savedVideo = await saveToStorageAndSign(
                   convId,
+          contactPhone,
                   `${waMessageId}_ad_video`,
                   file.mime,
                   file.buf
@@ -1054,21 +1065,29 @@ export default async function handler(req, res) {
 
     // ===== ESTADOS =====
     for (const s of value.statuses || []) {
-      const convId = normalizeE164AR(s.recipient_id);
-      if (!convId || !s?.id) continue;
+      const contactPhone = normalizeE164AR(s.recipient_id);
+      if (!contactPhone || !s?.id) continue;
 
       const statusAt = s.timestamp ? new Date(Number(s.timestamp) * 1000) : null;
+      const resolved = await resolveConversationContext(db, {
+        rawPhone: contactPhone,
+        phoneId,
+        preferScopedId: true,
+      });
+
+      const targetConversationId = resolved?.conversationId || buildScopedConversationId(contactPhone, phoneId);
+      if (!targetConversationId) continue;
 
       await db
         .collection("conversations")
-        .doc(convId)
+        .doc(targetConversationId)
         .collection("messages")
         .doc(s.id)
         .set(
           stripUndefined({
             status: s.status,
-            statusTimestamp: FieldValue.serverTimestamp(), // server time
-            ...(statusAt ? { statusAt } : {}), // event time si viene
+            statusTimestamp: FieldValue.serverTimestamp(),
+            ...(statusAt ? { statusAt } : {}),
             rawStatus: s,
           }),
           { merge: true }

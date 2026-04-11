@@ -9,6 +9,13 @@
 
 import admin from "../lib/firebaseAdmin.js";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import {
+  buildContactDocIds,
+  buildScopedConversationId,
+  digits,
+  normalizeE164AR,
+  resolveConversationContext,
+} from "../lib/conversationScope.js";
 
 // ====== Config ======
 const GRAPH_BASE = "https://graph.facebook.com/v23.0";
@@ -51,40 +58,9 @@ const PRIVATE_VM_USERS = {
 };
 
 // ====== helpers números (AR) ======
-const digits = (s) => String(s || "").replace(/\D+/g, "");
-
-// Normaliza a E.164 AR canónico: +549{area}{local}
-function normalizeE164AR(raw) {
-  let d = digits(raw);
-  if (!d) return "";
-
-  // ya canónico 549...
-  if (d.startsWith("549")) return `+${d}`;
-
-  // caso 54{area}15{local} -> +549{area}{local}
-  const m5415 = d.match(/^54(\d{2,4})15(\d+)$/);
-  if (m5415) {
-    const [, area, local] = m5415;
-    return `+549${area}${local}`;
-  }
-
-  // si viene 54... sin 15, lo dejamos +54...
-  if (d.startsWith("54")) return `+${d}`;
-
-  // si viene con 00
-  if (d.startsWith("00")) d = d.slice(2);
-
-  // si viene con 0 adelante
-  d = d.replace(/^0+/, "");
-
-  return `+${d}`;
-}
-
-// Candidatos de envío (Meta quiere dígitos sin '+'): probamos 549 y 5415
 function candidatesForSendAR(toRaw) {
   const d0 = digits(toRaw);
 
-  // ya 549...
   if (/^549\d+$/.test(d0)) {
     const areaLocal = d0.slice(3);
     const m = areaLocal.match(/^(\d{2,4})(\d+)$/);
@@ -93,44 +69,22 @@ function candidatesForSendAR(toRaw) {
     return PREFER_5415 ? [`54${area}15${rest}`, d0] : [d0, `54${area}15${rest}`];
   }
 
-  // ya 5415...
   const m5415 = d0.match(/^54(\d{2,4})15(\d+)$/);
   if (m5415) {
     const [, area, rest] = m5415;
     return PREFER_5415 ? [d0, `549${area}${rest}`] : [`549${area}${rest}`, d0];
   }
 
-  // fallback: inferir area/local (simple)
   let d = d0;
   if (d.startsWith("00")) d = d.slice(2);
   d = d.replace(/^0+/, "");
 
-  // heurística: CABA 11 + 8, si no 3 dígitos area
   const area = /^11\d{8}$/.test(d) ? d.slice(0, 2) : d.slice(0, 3);
   const local = d.slice(area.length);
 
   const v549 = `549${area}${local}`;
   const v5415 = `54${area}15${local}`;
   return PREFER_5415 ? [v5415, v549] : [v549, v5415];
-}
-
-// Canonical convId AR (+549...) robusto: intenta con raw y con candidatos
-function canonicalConvIdAR(raw) {
-  const tryOne = (x) => {
-    const n = normalizeE164AR(x);
-    return n && n.startsWith("+54") ? n : "";
-  };
-
-  const direct = tryOne(raw);
-  if (direct) return direct;
-
-  const cands = candidatesForSendAR(raw);
-  for (const c of cands) {
-    const n = tryOne(c);
-    if (n && n.startsWith("+549")) return n;
-    if (n) return n;
-  }
-  return "";
 }
 
 // ====== sanitize ======
@@ -202,10 +156,20 @@ function fallbackKeysForIndex(idx) {
 function buildResolvedTextFromVars(tName, vars) {
   const v1 = stripZWSP(vars?.[0]); // cliente
   const v2 = stripZWSP(vars?.[1]); // vendedora
-  const promos = (vars || []).slice(2).map(stripZWSP).filter(Boolean);
+  const extras = (vars || []).slice(2).map(stripZWSP).filter(Boolean);
+  const brandName = String(process.env.VITE_BRAND_NAME || "HogarCril").trim();
 
   if (tName === "reengage_free_text") {
-    return (v1 || `[Plantilla ${tName}]`).trim();
+    const freeText = extras[0] || "";
+
+    if (freeText && freeText.toLowerCase() !== brandName.toLowerCase()) {
+      return freeText.trim();
+    }
+
+    const hello = v1 ? `Hola ${v1}` : "Hola";
+    const sellerPart = v2 ? `, soy ${v2}` : "";
+    const brandPart = brandName ? ` de ${brandName}` : "";
+    return `${hello}${sellerPart}${brandPart}.`.trim();
   }
 
   if (tName === "promo_hogarcril_combos") {
@@ -222,7 +186,7 @@ function buildResolvedTextFromVars(tName, vars) {
     }
 
     let out = header;
-    if (promos.length) out += `\n\n${promos.join("\n")}`;
+    if (extras.length) out += `\n\n${extras.join("\n")}`;
     out += "\n\n¿Querés que te reserve alguno?";
 
     return out.trim();
@@ -286,6 +250,63 @@ async function readJson(req) {
   }
 }
 
+async function getUserWaPhoneId(db, uid) {
+  try {
+    const userDoc = await db.collection("users").doc(String(uid || "")).get();
+    if (!userDoc.exists) return "";
+    return String(userDoc.data()?.waPhoneId || "").trim();
+  } catch (e) {
+    console.error("[send-template] users/{uid}.waPhoneId lookup failed:", e?.message || e);
+    return "";
+  }
+}
+
+async function resolveGeneralPhoneId(db, uid, email) {
+  let phoneEnvKey = null;
+
+  try {
+    const docSnap = await db.collection("sellers").doc(String(uid || "")).get();
+    if (docSnap.exists) {
+      phoneEnvKey = String(docSnap.data()?.phoneEnvKey || "").trim() || null;
+    }
+  } catch (e) {
+    console.error("[send-template] sellers/{uid} lookup failed:", e?.message || e);
+  }
+
+  if (!phoneEnvKey && email) {
+    phoneEnvKey = EMAIL_TO_ENV[email] || null;
+  }
+
+  if (phoneEnvKey && process.env[phoneEnvKey]) {
+    return {
+      phoneId: process.env[phoneEnvKey],
+      phoneEnvKey,
+      phoneSource: "seller-env",
+    };
+  }
+
+  const waPhoneId = await getUserWaPhoneId(db, uid);
+  if (waPhoneId) {
+    return {
+      phoneId: waPhoneId,
+      phoneEnvKey: null,
+      phoneSource: "users.waPhoneId",
+    };
+  }
+
+  const fallbackPhoneId =
+    process.env.META_WA_PHONE_ID ||
+    process.env.META_WA_PHONE_ID_0453 ||
+    process.env.META_WA_PHONE_ID_8148 ||
+    "";
+
+  return {
+    phoneId: fallbackPhoneId,
+    phoneEnvKey,
+    phoneSource: fallbackPhoneId ? "default-env" : "default-missing",
+  };
+}
+
 // ====== main ======
 export default async function handler(req, res) {
   try {
@@ -309,76 +330,6 @@ export default async function handler(req, res) {
     const uid = decoded.uid;
     const email = (decoded.email || "").toLowerCase().trim();
 
-    // ── Resolver PHONE_ID
-    let phoneEnvKey = null;
-    let PHONE_ID = null;
-    let phoneSource = null;
-
-    // 1) Villa María: primero resolver por users/{uid}.waPhoneId
-    const privateVmCfg = PRIVATE_VM_USERS[email] || null;
-
-    if (privateVmCfg) {
-      try {
-        const userDoc = await db.collection("users").doc(uid).get();
-        if (userDoc.exists) {
-          const waPhoneId = String(userDoc.data()?.waPhoneId || "").trim();
-          if (waPhoneId) {
-            PHONE_ID = waPhoneId;
-            phoneSource = "users.waPhoneId";
-          }
-        }
-      } catch (e) {
-        console.error("[send-template] users/{uid} lookup failed:", e?.message || e);
-      }
-
-      // fallback 1: env específica de Villa María
-      if (!PHONE_ID && privateVmCfg.fallbackEnvKey && process.env[privateVmCfg.fallbackEnvKey]) {
-        phoneEnvKey = privateVmCfg.fallbackEnvKey;
-        PHONE_ID = process.env[privateVmCfg.fallbackEnvKey];
-        phoneSource = "private-env-fallback";
-      }
-
-      // fallback 2: hardcode del phoneId real
-      if (!PHONE_ID && privateVmCfg.fallbackPhoneId) {
-        phoneEnvKey = privateVmCfg.fallbackEnvKey || null;
-        PHONE_ID = privateVmCfg.fallbackPhoneId;
-        phoneSource = "private-hardcoded-fallback";
-      }
-    }
-
-    // 2) Córdoba / resto: mantener lógica actual
-    if (!PHONE_ID) {
-      try {
-        const docSnap = await db.collection("sellers").doc(uid).get();
-        if (docSnap.exists) phoneEnvKey = docSnap.data()?.phoneEnvKey || null;
-      } catch (e) {
-        console.error("[send-template] sellers/{uid} lookup failed:", e?.message || e);
-      }
-
-      if (!phoneEnvKey && email) {
-        phoneEnvKey = EMAIL_TO_ENV[email] || "META_WA_PHONE_ID";
-      }
-
-      PHONE_ID =
-        (phoneEnvKey && process.env[phoneEnvKey]) ||
-        process.env.META_WA_PHONE_ID ||
-        process.env.META_WA_PHONE_ID_0453 ||
-        process.env.META_WA_PHONE_ID_8148;
-
-      if (PHONE_ID && !phoneSource) {
-        phoneSource = phoneEnvKey ? "seller-env" : "default-env";
-      }
-    }
-
-    const TOKEN = process.env.META_WA_TOKEN;
-
-    if (!PHONE_ID || !TOKEN) {
-      return res.status(500).json({
-        error: `Missing PHONE_ID (${phoneEnvKey || "null"}) or META_WA_TOKEN`,
-        seller: { uid, email },
-      });
-    }
-
     // ── Body (acepta payload viejo y nuevo)
     const input = await readJson(req);
 
@@ -386,6 +337,66 @@ export default async function handler(req, res) {
       input?.to || input?.phone || input?.contactId || input?.contact || input?.number;
 
     if (!toRaw) return res.status(400).json({ error: "Missing phone/to" });
+
+    // ── Resolver PHONE_ID + contexto de conversación
+    let phoneEnvKey = null;
+    let PHONE_ID = null;
+    let phoneSource = null;
+
+    const requestedConversationId = String(input?.conversationId || "").trim();
+    const requestedPhoneId = String(input?.fromWaPhoneId || input?.phoneId || "").trim();
+
+    const initialCtx = await resolveConversationContext(db, {
+      conversationId: requestedConversationId,
+      rawPhone: toRaw,
+      phoneId: requestedPhoneId,
+      preferScopedId: false,
+    });
+
+    if (requestedPhoneId) {
+      PHONE_ID = requestedPhoneId;
+      phoneSource = "explicit";
+    }
+
+    if (!PHONE_ID) {
+      const inboundPhoneId = String(
+        initialCtx?.data?.lastInboundPhoneId ||
+          initialCtx?.data?.scopedPhoneNumberId ||
+          initialCtx?.data?.businessPhoneId ||
+          ""
+      ).trim();
+
+      if (inboundPhoneId) {
+        PHONE_ID = inboundPhoneId;
+        phoneSource = "conversation.phoneId";
+      }
+    }
+
+    if (!PHONE_ID) {
+      const resolvedPhone = await resolveGeneralPhoneId(db, uid, email);
+      PHONE_ID = resolvedPhone.phoneId || null;
+      phoneEnvKey = resolvedPhone.phoneEnvKey || null;
+      phoneSource = resolvedPhone.phoneSource || null;
+    }
+
+    const resolvedCtx = await resolveConversationContext(db, {
+      conversationId: requestedConversationId,
+      rawPhone: toRaw,
+      phoneId: PHONE_ID,
+      preferScopedId: true,
+    });
+
+    const normalizedPhone = resolvedCtx?.normalizedPhone || normalizeE164AR(toRaw);
+
+    const TOKEN = process.env.META_WA_TOKEN;
+
+    if (!PHONE_ID || !TOKEN) {
+      return res.status(500).json({
+        error: `Missing PHONE_ID (${phoneEnvKey || "null"}) or META_WA_TOKEN`,
+        seller: { uid, email },
+        phoneSource,
+      });
+    }
 
     const tplObj = input?.template || null;
 
@@ -462,27 +473,30 @@ export default async function handler(req, res) {
 
     // ====== Seguridad / compliance: opt-in ======
     try {
-      const convIdForCheck = canonicalConvIdAR(toRaw);
-      if (!convIdForCheck) {
+      if (!normalizedPhone) {
         return res.status(400).json({ error: "Invalid phone (not AR canonical)" });
       }
 
-      const convSnap = await db.collection("conversations").doc(convIdForCheck).get();
-      if (!convSnap.exists) {
+      if (!resolvedCtx?.data) {
         return res.status(404).json({
           error: "Conversation not found for opt-in check",
-          details: { convId: convIdForCheck },
+          details: { conversationId: resolvedCtx?.conversationId || null, phone: normalizedPhone },
         });
       }
 
-      const dataConv = convSnap.data() || {};
+      const dataConv = resolvedCtx.data || {};
       const marketingOptInValue = dataConv.marketingOptIn;
       const optIn = dataConv.optIn === true;
 
       if (marketingOptInValue === false) {
         return res.status(403).json({
           error: "Contact opted-out of marketing (marketingOptIn=false)",
-          details: { optIn, marketingOptIn: marketingOptInValue, REQUIRE_MARKETING_OPTIN },
+          details: {
+            optIn,
+            marketingOptIn: marketingOptInValue,
+            REQUIRE_MARKETING_OPTIN,
+            conversationId: resolvedCtx?.conversationId || null,
+          },
         });
       }
 
@@ -493,7 +507,12 @@ export default async function handler(req, res) {
       if (!allowed) {
         return res.status(403).json({
           error: "Contact is not opted-in for marketing messages",
-          details: { optIn, marketingOptIn: marketingOptInValue, REQUIRE_MARKETING_OPTIN },
+          details: {
+            optIn,
+            marketingOptIn: marketingOptInValue,
+            REQUIRE_MARKETING_OPTIN,
+            conversationId: resolvedCtx?.conversationId || null,
+          },
         });
       }
     } catch (e) {
@@ -502,7 +521,7 @@ export default async function handler(req, res) {
     }
 
     // ====== Envío a Graph (probando 549/5415) ======
-    const cands = candidatesForSendAR(toRaw);
+    const cands = candidatesForSendAR(normalizedPhone);
 
     let upstreamOk = false;
     let data = null;
@@ -556,19 +575,38 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: lastErr?.error || lastErr });
     }
 
-    // ====== Guardar OUT en Firestore (convId canónico) ======
+    // ====== Guardar OUT en Firestore (convId scopeado por línea) ======
+    let responseConversationId = resolvedCtx?.conversationId || null;
     try {
       const msgId = data?.messages?.[0]?.id || data?.message_id || null;
 
-      const convId = canonicalConvIdAR(usedToDigits || toRaw);
+      const effectivePhone = normalizeE164AR(usedToDigits || normalizedPhone || toRaw);
+      const convId = responseConversationId || buildScopedConversationId(effectivePhone, PHONE_ID);
+      responseConversationId = convId;
+
       const resolvedText = buildResolvedTextFromVars(tName, vars);
       const textPreview = previewFromVars(tName, vars);
 
       const convRef = db.collection("conversations").doc(convId);
+      const contactDocIds = buildContactDocIds({ conversationId: convId, normalizedPhone: effectivePhone });
+      const baseContactData = {
+        phone: effectivePhone,
+        waId: digits(effectivePhone),
+        conversationId: convId,
+        scopedPhoneNumberId: PHONE_ID,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+      for (const contactDocId of contactDocIds) {
+        await db.collection("contacts").doc(contactDocId).set(baseContactData, { merge: true });
+      }
 
       await convRef.set(
         {
-          contactId: convId,
+          contactId: effectivePhone,
+          clientPhone: effectivePhone,
+          conversationId: convId,
+          scopedPhoneNumberId: PHONE_ID,
+          businessPhoneId: PHONE_ID,
           lastMessageAt: FieldValue.serverTimestamp(),
           lastMessageDirection: "out",
           lastMessageText: textPreview,
@@ -589,8 +627,8 @@ export default async function handler(req, res) {
             language: lang,
             components: fixedComponents,
           },
-          vars, // para mostrar en CRM
-          metaVars, // lo que se mandó realmente a Meta
+          vars,
+          metaVars,
           text: resolvedText,
           resolvedText,
           body: resolvedText,
@@ -599,7 +637,7 @@ export default async function handler(req, res) {
           timestamp: FieldValue.serverTimestamp(),
           status: "sent",
           sendVariant: usedToDigits?.startsWith("549") ? "549" : "5415",
-          to: convId,
+          to: effectivePhone,
           toRawSent: usedToDigits ? `+${usedToDigits}` : undefined,
           rawResponse: data,
         },
@@ -613,6 +651,7 @@ export default async function handler(req, res) {
       ok: true,
       data,
       template: tName,
+      conversationId: responseConversationId,
       from_phone_id: PHONE_ID,
       seller_uid: uid,
       seller_email: email,
