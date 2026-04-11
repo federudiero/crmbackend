@@ -24,7 +24,6 @@ function safeParseBody(req) {
   }
 }
 
-
 function getInboundProfileName(value, m, convId) {
   const contacts = Array.isArray(value?.contacts) ? value.contacts : [];
   if (!contacts.length) return "";
@@ -161,6 +160,102 @@ const SHARED_MANUAL_INBOX_PHONE_IDS = new Set([
 function isSharedManualInboxPhone(phoneId) {
   const id = String(phoneId || "").trim();
   return !!id && SHARED_MANUAL_INBOX_PHONE_IDS.has(id);
+}
+
+/**
+ * Resuelve la conversación entrante sin duplicar legacy + scopeado de la misma línea.
+ *
+ * Prioridad:
+ * 1) Si ya existe el chat scopeado de esa línea, usarlo.
+ * 2) Si no existe scopeado pero sí existe legacy del mismo cliente:
+ *    - si no tiene línea guardada todavía, reutilizar legacy
+ *    - si tiene la misma línea, reutilizar legacy
+ * 3) Si no hay nada compatible, crear el scopeado nuevo.
+ */
+async function resolveInboundConversationId({ db, contactPhone, phoneId }) {
+  const normalizedPhone = normalizeE164AR(contactPhone);
+  const normalizedPhoneId = String(phoneId || "").trim() || null;
+
+  if (!normalizedPhone) return null;
+
+  const scopedId = buildScopedConversationId(normalizedPhone, normalizedPhoneId);
+  const legacyId = normalizedPhone;
+
+  // 1) Si ya existe el scopeado exacto, usarlo.
+  if (scopedId) {
+    const scopedSnap = await db.collection("conversations").doc(scopedId).get();
+    if (scopedSnap.exists) {
+      return scopedId;
+    }
+  }
+
+  // 2) Si existe legacy del mismo cliente, reutilizarlo si pertenece a la misma línea
+  //    o si todavía no tenía línea guardada.
+  const legacySnap = await db.collection("conversations").doc(legacyId).get();
+  if (legacySnap.exists) {
+    const legacyLineId =
+      String(
+        legacySnap.get("scopedPhoneNumberId") ||
+          legacySnap.get("lastInboundPhoneId") ||
+          legacySnap.get("businessPhoneId") ||
+          ""
+      ).trim() || null;
+
+    if (!legacyLineId || legacyLineId === normalizedPhoneId) {
+      return legacyId;
+    }
+  }
+
+  // 3) Fallback: usar el resolver general por si encuentra algún contexto ya existente.
+  try {
+    const resolved = await resolveConversationContext(db, {
+      rawPhone: normalizedPhone,
+      phoneId: normalizedPhoneId,
+      preferScopedId: true,
+    });
+
+    const resolvedId = String(resolved?.conversationId || "").trim();
+    if (resolvedId) {
+      if (resolvedId === scopedId || resolvedId === legacyId) {
+        return resolvedId;
+      }
+
+      const resolvedSnap = await db
+        .collection("conversations")
+        .doc(resolvedId)
+        .get();
+
+      if (resolvedSnap.exists) {
+        const resolvedContactPhone = normalizeE164AR(
+          resolvedSnap.get("contactId") || resolvedSnap.get("clientPhone") || ""
+        );
+
+        const resolvedLineId =
+          String(
+            resolvedSnap.get("scopedPhoneNumberId") ||
+              resolvedSnap.get("lastInboundPhoneId") ||
+              resolvedSnap.get("businessPhoneId") ||
+              ""
+          ).trim() || null;
+
+        const sameContact =
+          !resolvedContactPhone || resolvedContactPhone === normalizedPhone;
+        const sameLine =
+          !resolvedLineId ||
+          !normalizedPhoneId ||
+          resolvedLineId === normalizedPhoneId;
+
+        if (sameContact && sameLine) {
+          return resolvedId;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[waWebhook] resolveInboundConversationId fallback error:", err);
+  }
+
+  // 4) Si no hay nada compatible, crear el nuevo scopeado.
+  return scopedId || legacyId;
 }
 
 /** Descarga metadata + binario del media de WhatsApp (con reintentos rápidos) */
@@ -310,7 +405,7 @@ async function fetchUrlMedia(url, retryCount = 0) {
       console.warn(
         `⚠️ [fetchUrlMedia] descargado pero supera MAX_BYTES: ${buf.length} > ${MAX_BYTES}`
       );
-      return { tooLarge: true, mime, size: buf.length };
+      return { tooLarge: true, mime, size: buf.length, TRY_VIDEO };
     }
 
     return { buf, mime, size: buf.length, TRY_VIDEO };
@@ -370,7 +465,12 @@ export default async function handler(req, res) {
     // ===== MENSAJES ENTRANTES =====
     for (const m of value.messages || []) {
       const contactPhone = normalizeE164AR(m.from);
-      const convId = buildScopedConversationId(contactPhone, phoneId);
+      const convId = await resolveInboundConversationId({
+        db,
+        contactPhone,
+        phoneId,
+      });
+
       const waMessageId = m.id;
       const tsSec = Number(m.timestamp || Math.floor(Date.now() / 1000));
       const eventTsMs = Number.isFinite(tsSec) ? tsSec * 1000 : Date.now();
@@ -389,7 +489,10 @@ export default async function handler(req, res) {
       const convRef = db.collection("conversations").doc(convId);
 
       // contact
-      const contactDocIds = buildContactDocIds({ conversationId: convId, normalizedPhone: contactPhone });
+      const contactDocIds = buildContactDocIds({
+        conversationId: convId,
+        normalizedPhone: contactPhone,
+      });
       const contactSnap = await db.collection("contacts").doc(convId).get();
 
       const contactData = {
@@ -410,9 +513,16 @@ export default async function handler(req, res) {
             }
           : {}),
       };
-      if (!contactSnap.exists) contactData.createdAt = FieldValue.serverTimestamp();
+
+      if (!contactSnap.exists) {
+        contactData.createdAt = FieldValue.serverTimestamp();
+      }
+
       for (const contactDocId of contactDocIds) {
-        await db.collection("contacts").doc(contactDocId).set(stripUndefined(contactData), { merge: true });
+        await db
+          .collection("contacts")
+          .doc(contactDocId)
+          .set(stripUndefined(contactData), { merge: true });
       }
 
       // conversation + auto-assign: ✅ transaction (evita carreras)
@@ -486,14 +596,14 @@ export default async function handler(req, res) {
           if (isNew || !hasOwner) {
             console.log("Inbox compartida con asignación manual", {
               convId,
-          contactPhone,
+              contactPhone,
               phoneId,
               reason: isNew ? "new-conversation" : "unassigned-conversation",
             });
           } else {
             console.log("Inbox compartida conservó asignación existente", {
               convId,
-          contactPhone,
+              contactPhone,
               phoneId,
               currentAssignedToUid: currentAssignedUid || null,
               currentAssignedToEmail: currentAssignedEmail || null,
@@ -518,7 +628,7 @@ export default async function handler(req, res) {
 
             console.log("Auto-asignada por área", {
               convId,
-          contactPhone,
+              contactPhone,
               area: route.area,
               to: route.uid,
             });
@@ -592,7 +702,6 @@ export default async function handler(req, res) {
             } else if (file?.buf) {
               savedImage = await saveToStorageAndSign(
                 convId,
-          contactPhone,
                 `${waMessageId}_ad_image`,
                 file.mime,
                 file.buf
@@ -610,7 +719,6 @@ export default async function handler(req, res) {
               } else if (file?.buf) {
                 savedThumb = await saveToStorageAndSign(
                   convId,
-          contactPhone,
                   `${waMessageId}_ad_thumb`,
                   file.mime,
                   file.buf
@@ -626,7 +734,6 @@ export default async function handler(req, res) {
               } else if (file?.buf) {
                 savedVideo = await saveToStorageAndSign(
                   convId,
-          contactPhone,
                   `${waMessageId}_ad_video`,
                   file.mime,
                   file.buf
@@ -705,7 +812,14 @@ export default async function handler(req, res) {
         if (imgId) {
           try {
             const file = await fetchMedia(imgId);
-            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            if (file) {
+              saved = await saveToStorageAndSign(
+                convId,
+                waMessageId,
+                file.mime,
+                file.buf
+              );
+            }
           } catch (error) {
             console.error("🖼️ ERROR downloading/saving image:", error);
           }
@@ -737,7 +851,14 @@ export default async function handler(req, res) {
         if (audId) {
           try {
             const file = await fetchMedia(audId);
-            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            if (file) {
+              saved = await saveToStorageAndSign(
+                convId,
+                waMessageId,
+                file.mime,
+                file.buf
+              );
+            }
           } catch (e) {
             console.error("audio error:", e);
           }
@@ -746,7 +867,9 @@ export default async function handler(req, res) {
         const media = {
           kind: "audio",
           ...(Boolean(m.audio?.voice) ? { voice: true } : {}),
-          ...(Number.isFinite(m.audio?.duration) ? { duration: Number(m.audio.duration) } : {}),
+          ...(Number.isFinite(m.audio?.duration)
+            ? { duration: Number(m.audio.duration) }
+            : {}),
           ...(m.audio?.mime_type ? { mime: m.audio.mime_type } : {}),
           ...(saved?.path ? { path: saved.path } : {}),
           ...((saved?.url || audLink) ? { url: saved?.url || audLink } : {}),
@@ -765,7 +888,14 @@ export default async function handler(req, res) {
         if (docId) {
           try {
             const file = await fetchMedia(docId);
-            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            if (file) {
+              saved = await saveToStorageAndSign(
+                convId,
+                waMessageId,
+                file.mime,
+                file.buf
+              );
+            }
           } catch (error) {
             console.error("📄 ERROR downloading/saving document:", error);
           }
@@ -780,7 +910,10 @@ export default async function handler(req, res) {
         };
 
         if (!media.url) {
-          messageData.media = { kind: "document", ...(media.filename ? { filename: media.filename } : {}) };
+          messageData.media = {
+            kind: "document",
+            ...(media.filename ? { filename: media.filename } : {}),
+          };
           messageData.hasMedia = true;
           messageData.mediaError = "DOWNLOAD_FAILED_EXPIRED";
         } else {
@@ -798,7 +931,14 @@ export default async function handler(req, res) {
         if (vidId) {
           try {
             const file = await fetchMedia(vidId);
-            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            if (file) {
+              saved = await saveToStorageAndSign(
+                convId,
+                waMessageId,
+                file.mime,
+                file.buf
+              );
+            }
           } catch (e) {
             console.error("video error:", e);
           }
@@ -808,7 +948,9 @@ export default async function handler(req, res) {
           kind: "video",
           ...(m.video?.filename ? { filename: m.video.filename } : {}),
           ...(m.video?.mime_type ? { mime: m.video.mime_type } : {}),
-          ...(Number.isFinite(m.video?.duration) ? { duration: Number(m.video.duration) } : {}),
+          ...(Number.isFinite(m.video?.duration)
+            ? { duration: Number(m.video.duration) }
+            : {}),
           ...(saved?.path ? { path: saved.path } : {}),
           ...((saved?.url || vidLink) ? { url: saved?.url || vidLink } : {}),
         };
@@ -849,7 +991,14 @@ export default async function handler(req, res) {
         if (stkId) {
           try {
             const file = await fetchMedia(stkId);
-            if (file) saved = await saveToStorageAndSign(convId, waMessageId, file.mime, file.buf);
+            if (file) {
+              saved = await saveToStorageAndSign(
+                convId,
+                waMessageId,
+                file.mime,
+                file.buf
+              );
+            }
           } catch (e) {
             console.error("sticker error:", e);
           }
@@ -932,7 +1081,10 @@ export default async function handler(req, res) {
       // ✅ guardar mensaje (SIN stringify)
       const cleanMessage = stripUndefined(messageData);
 
-      await convRef.collection("messages").doc(waMessageId).set(cleanMessage, { merge: true });
+      await convRef
+        .collection("messages")
+        .doc(waMessageId)
+        .set(cleanMessage, { merge: true });
 
       // 🔔 PUSH FCM + ✉️ EMAIL (si hay asignado)
       try {
@@ -1075,7 +1227,10 @@ export default async function handler(req, res) {
         preferScopedId: true,
       });
 
-      const targetConversationId = resolved?.conversationId || buildScopedConversationId(contactPhone, phoneId);
+      const targetConversationId =
+        resolved?.conversationId ||
+        buildScopedConversationId(contactPhone, phoneId);
+
       if (!targetConversationId) continue;
 
       await db
