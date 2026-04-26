@@ -46,7 +46,7 @@ const EMAIL_TO_ENV = {
 
 const PRIVATE_VM_USERS = {
   "escalantefr.p@gmail.com": {
-    fallbackPhoneId: "721961900420098",
+    fallbackPhoneId: "1126748053852551",
     fallbackEnvKey: "META_WA_PHONE_ID_VM",
     label: "Fernando Escalante",
   },
