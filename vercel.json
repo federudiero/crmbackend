@@ -1,0 +1,63 @@
+{
+  "functions": {
+    "api/upload.js": {
+      "maxDuration": 60
+    },
+    "api/waWebhook.js": {
+      "maxDuration": 60
+    },
+    "api/index.js": {
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/bulk-optin",
+      "destination": "/api/index?__crmInternalRoute=bulk-optin"
+    },
+    {
+      "source": "/api/check-template-eligibility",
+      "destination": "/api/index?__crmInternalRoute=check-template-eligibility"
+    },
+    {
+      "source": "/api/crmManagement",
+      "destination": "/api/index?__crmInternalRoute=crmManagement"
+    },
+    {
+      "source": "/api/debugEnv",
+      "destination": "/api/index?__crmInternalRoute=debugEnv"
+    },
+    {
+      "source": "/api/handleExpiredMedia",
+      "destination": "/api/index?__crmInternalRoute=handleExpiredMedia"
+    },
+    {
+      "source": "/api/inventory",
+      "destination": "/api/index?__crmInternalRoute=inventory"
+    },
+    {
+      "source": "/api/notifyInbound",
+      "destination": "/api/index?__crmInternalRoute=notifyInbound"
+    },
+    {
+      "source": "/api/purgeConversations",
+      "destination": "/api/index?__crmInternalRoute=purgeConversations"
+    },
+    {
+      "source": "/api/send-template",
+      "destination": "/api/index?__crmInternalRoute=send-template"
+    },
+    {
+      "source": "/api/sendMessage",
+      "destination": "/api/index?__crmInternalRoute=sendMessage"
+    },
+    {
+      "source": "/api/sender",
+      "destination": "/api/index?__crmInternalRoute=sender"
+    },
+    {
+      "source": "/api/templates",
+      "destination": "/api/index?__crmInternalRoute=templates"
+    }
+  ]
+}
