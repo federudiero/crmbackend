@@ -8,6 +8,13 @@ import {
   resolveConversationContext,
 } from "../lib/conversationScope.js";
 import { sendEmail } from "../lib/email.js";
+import {
+  buildInboundCrmPatch,
+  buildInboundEvent,
+  getCrmEventRef,
+  parseSmbMessageEcho,
+  recordConfirmedSellerResponse,
+} from "../lib/crmManagement.js";
 // import crypto from "crypto"; // (opcional) para firma webhook
 
 function cors(res) {
@@ -455,7 +462,48 @@ export default async function handler(req, res) {
 
   try {
     const body = safeParseBody(req);
-    const value = body?.entry?.[0]?.changes?.[0]?.value;
+    const changes = (Array.isArray(body?.entry) ? body.entry : []).flatMap((entry) =>
+      Array.isArray(entry?.changes) ? entry.changes : []
+    );
+
+    // Coexistence: Meta publica los mensajes enviados desde WhatsApp Business
+    // en el campo smb_message_echoes. Se procesan aparte para no alterar el
+    // flujo actual de messages/statuses ni contar dos veces un reintento.
+    for (const change of changes) {
+      if (change?.field !== "smb_message_echoes") continue;
+      const echoValue = change?.value || {};
+      const echoes = Array.isArray(echoValue?.message_echoes)
+        ? echoValue.message_echoes
+        : [];
+      for (const rawEcho of echoes) {
+        const echo = parseSmbMessageEcho(echoValue, rawEcho);
+        if (!echo) {
+          console.warn("[waWebhook] smb_message_echoes inválido", {
+            hasPhoneId: Boolean(echoValue?.metadata?.phone_number_id || rawEcho?.phone_number_id),
+            hasMessageId: Boolean(rawEcho?.id || rawEcho?.message_id),
+          });
+          continue;
+        }
+        const result = await recordConfirmedSellerResponse({
+          phone: echo.phone,
+          phoneId: echo.phoneId,
+          messageId: echo.messageId,
+          occurredAt: echo.occurredAt,
+          source: "whatsapp_business_app",
+          type: echo.type,
+          text: echo.text,
+          raw: echo.raw,
+        });
+        console.log("[waWebhook] smb_message_echoes procesado", result);
+      }
+    }
+
+    const standardChange = changes.find(
+      (change) =>
+        change?.field !== "smb_message_echoes" &&
+        (Array.isArray(change?.value?.messages) || Array.isArray(change?.value?.statuses))
+    );
+    const value = standardChange?.value;
     if (!value) return res.status(200).send("EVENT_RECEIVED");
 
     const meta = value.metadata || {};
@@ -529,6 +577,8 @@ export default async function handler(req, res) {
       // conversation + auto-assign: ✅ transaction (evita carreras)
       await db.runTransaction(async (tx) => {
         const snap = await tx.get(convRef);
+        const crmEventRef = getCrmEventRef(`meta_in_${waMessageId}`);
+        const crmEventSnap = await tx.get(crmEventRef);
         const isNew = !snap.exists;
 
         const currentAssignedUid = String(snap.get("assignedToUid") || "").trim();
@@ -538,6 +588,9 @@ export default async function handler(req, res) {
         const hasOwner = !!currentAssignedUid || !!currentAssignedEmail;
 
         const now = FieldValue.serverTimestamp();
+        const eventDate = new Date(eventTsMs);
+        let eventAssignedUid = currentAssignedUid || null;
+        let eventAssignedEmail = currentAssignedEmail || null;
 
         const prevLastMsgTs = Number(snap.get("lastMessageTsMs") || 0);
         const prevLastInboundTs = Number(snap.get("lastInboundTsMs") || 0);
@@ -573,16 +626,16 @@ export default async function handler(req, res) {
 
         if (isNew) {
           baseConv.createdAt = now;
-          baseConv.firstInboundAt = now;
+          baseConv.firstInboundAt = eventDate;
         }
 
         if (shouldUpdateLastInbound) {
-          baseConv.lastInboundAt = now;
+          baseConv.lastInboundAt = eventDate;
           baseConv.lastInboundTsMs = eventTsMs;
         }
 
         if (shouldUpdateLastMessage) {
-          baseConv.lastMessageAt = now;
+          baseConv.lastMessageAt = eventDate;
           baseConv.lastMessageText = text || "";
           baseConv.lastMessageDirection = "in";
           baseConv.lastMessageType = m.type || "text";
@@ -626,6 +679,8 @@ export default async function handler(req, res) {
               assignedAt: now,
             };
             tx.set(convRef, stripUndefined(assignPayload), { merge: true });
+            eventAssignedUid = route.uid;
+            eventAssignedEmail = route.email || null;
 
             console.log("Auto-asignada por área", {
               convId,
@@ -634,6 +689,33 @@ export default async function handler(req, res) {
               to: route.uid,
             });
           }
+        }
+
+        if (!crmEventSnap.exists) {
+          const { patch: crmPatch } = buildInboundCrmPatch({
+            data: snap.exists ? snap.data() || {} : {},
+            isNew,
+            occurredAt: eventDate,
+            message: m,
+            value,
+          });
+          tx.set(convRef, stripUndefined(crmPatch), { merge: true });
+          tx.create(
+            crmEventRef,
+            stripUndefined(
+              buildInboundEvent({
+                eventKey: `meta_in_${waMessageId}`,
+                conversationId: convId,
+                contactPhone,
+                message: m,
+                value,
+                isNew,
+                assignedToUid: eventAssignedUid,
+                assignedToEmail: eventAssignedEmail,
+                occurredAt: eventDate,
+              })
+            )
+          );
         }
       });
 

@@ -7,6 +7,7 @@ import {
   normalizeE164AR,
   resolveConversationContext,
 } from "../lib/conversationScope.js";
+import { recordConfirmedSellerResponse } from "../lib/crmManagement.js";
 
 // ====== CORS ======
 const CORS_HEADERS = {
@@ -614,6 +615,27 @@ export default async function handler(req, res) {
         },
         { merge: true }
       );
+
+      if (delivered) {
+        try {
+          await recordConfirmedSellerResponse({
+            conversationId: convId,
+            phone: normalizedPhone,
+            phoneId: PHONE_ID,
+            messageId: wamid,
+            occurredAt: new Date(),
+            source: "cloud_api",
+            actorUid: senderUid,
+            actorEmail: senderEmail,
+            type: sentType,
+            text: String(preview || "").slice(0, 4000),
+          });
+        } catch (crmError) {
+          // El mensaje ya salió por Meta: un fallo de auditoría no debe provocar
+          // un reenvío del mensaje al cliente.
+          console.error("[sendMessage] CRM response audit error:", crmError);
+        }
+      }
 
       results.push({
         to: convId,

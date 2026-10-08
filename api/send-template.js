@@ -16,6 +16,7 @@ import {
   normalizeE164AR,
   resolveConversationContext,
 } from "../lib/conversationScope.js";
+import { recordConfirmedSellerResponse } from "../lib/crmManagement.js";
 
 // ====== Config ======
 const GRAPH_BASE = "https://graph.facebook.com/v23.0";
@@ -643,6 +644,23 @@ export default async function handler(req, res) {
         },
         { merge: true }
       );
+
+      try {
+        await recordConfirmedSellerResponse({
+          conversationId: convId,
+          phone: effectivePhone,
+          phoneId: PHONE_ID,
+          messageId: newId,
+          occurredAt: new Date(),
+          source: "cloud_api",
+          actorUid: uid,
+          actorEmail: email,
+          type: "template",
+          text: resolvedText,
+        });
+      } catch (crmError) {
+        console.error("[send-template] CRM response audit error:", crmError);
+      }
     } catch (e) {
       console.error("[OUT MSG SAVE] error:", e);
     }
