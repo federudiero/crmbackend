@@ -36,6 +36,7 @@ export default async function handler(req, res) {
     return res.status(status).json({
       ok: false,
       error: error?.message || "Error interno de Gestión CRM",
+      ...(error?.details ? { details: error.details } : {}),
     });
   }
 }

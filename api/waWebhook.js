@@ -461,7 +461,32 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
-    const body = safeParseBody(req);
+    // Rechaza payloads sin firma válida. Solo se puede comprobar si conservamos bytes originales.
+    const { createHmac, timingSafeEqual } = await import('node:crypto');
+    const secret = process.env.META_APP_SECRET;
+    if (!secret) return res.status(503).send('Meta app secret no configurado');
+    const sig = String(req.headers['x-hub-signature-256'] || '');
+    const raw = req.rawBody ? Buffer.from(req.rawBody) : (typeof req.body === 'string' ? Buffer.from(req.body) : Buffer.concat(await (async () => { const parts = []; for await (const chunk of req) parts.push(Buffer.from(chunk)); return parts; })()));
+    if (!raw) return res.status(503).send('Raw webhook body required to verify signature');
+    if (raw.length > 1024 * 1024) return res.status(413).send('Webhook body too large');
+    const provided = sig.startsWith('sha256=') ? sig.slice(7) : '';
+    const expected = createHmac('sha256', secret).update(raw).digest('hex');
+    if (!/^[0-9a-f]{64}$/i.test(provided) || !timingSafeEqual(Buffer.from(provided, 'hex'), Buffer.from(expected, 'hex'))) {
+      return res.status(403).send('Invalid Meta signature');
+    }
+    const body = JSON.parse(raw.toString('utf8'));
+    const { processStatisticsOnly } = await import('../lib/waStatisticsOnly.js');
+    await processStatisticsOnly(body);
+    try {
+      const { processChatbotWebhook } = await import('../lib/chatbotRuntime.js');
+      await processChatbotWebhook(body);
+    } catch (chatbotError) {
+      // El runtime está aislado de estadísticas: un fallo nunca fuerza reintentos
+      // del webhook ni duplica atribución comercial.
+      console.error('[waWebhook] chatbot runtime error:', chatbotError?.message || chatbotError);
+    }
+    return res.status(200).send('EVENT_RECEIVED');
+
     const changes = (Array.isArray(body?.entry) ? body.entry : []).flatMap((entry) =>
       Array.isArray(entry?.changes) ? entry.changes : []
     );
@@ -1338,3 +1363,6 @@ export default async function handler(req, res) {
     return res.status(200).send("EVENT_RECEIVED");
   }
 }
+
+// El cuerpo debe preservarse byte a byte para verificar X-Hub-Signature-256.
+export const config = { api: { bodyParser: false } };

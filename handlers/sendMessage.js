@@ -314,6 +314,8 @@ function buildPreviewForSent({ sentType, text, template, image, audio, document 
 
 // ====== HANDLER ======
 export default async function handler(req, res) {
+  return res.status(410).json({ ok: false, error: "Cloud API deshabilitada: solo estadísticas" });
+
   setCors(res);
 
   if (req.method === "OPTIONS") return res.status(204).end();

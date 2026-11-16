@@ -18,6 +18,9 @@ const handlers = Object.freeze({
 
 export default async function handler(req, res) {
   const route = req.query?.__crmInternalRoute;
+  if (["sendMessage", "send-template", "bulk-optin", "templates"].includes(route)) {
+    return res.status(410).json({ ok: false, error: "CRM en modo estadísticas: envíos por API deshabilitados" });
+  }
   const load = typeof route === "string" && Object.prototype.hasOwnProperty.call(handlers, route)
     ? handlers[route]
     : null;

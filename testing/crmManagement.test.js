@@ -150,3 +150,37 @@ test("las métricas usan la misma muestra y excluyen aperturas de WhatsApp", () 
   assert.equal(metrics.responseSamples, 1);
   assert.equal(metrics.responseUnder5Percent, 100);
 });
+
+test("las métricas del chatbot miden desde la transferencia hasta la primera respuesta humana", () => {
+  const rows = [{
+    id: "bot-a",
+    phone: "+5493510000003",
+    gestionStatus: "vendido",
+    sold: true,
+    chatbotStatus: "HUMAN_ACTIVE",
+    chatbotFlowId: "flow",
+    chatbotFormCompleted: true,
+    chatbotTransferReason: "FLOW_COMPLETED",
+    chatbotTransferredAt: new Date("2026-09-08T10:00:00Z"),
+    firstSellerResponseAt: new Date("2026-09-08T10:05:00Z"),
+    firstInboundAt: new Date("2026-09-08T09:55:00Z"),
+    inboundMessageCount: 2,
+  }];
+  const metrics = crmInternals.buildMetrics(rows, [], { start: null, end: null });
+  assert.equal(metrics.chatbot.contacts, 1);
+  assert.equal(metrics.chatbot.formsCompleted, 1);
+  assert.equal(metrics.chatbot.transfers, 1);
+  assert.equal(metrics.chatbot.pendingHuman, 0);
+  assert.equal(metrics.chatbot.averageTimeToHumanSeconds, 300);
+  assert.equal(metrics.chatbot.sold, 1);
+});
+
+test("un vendedor no puede leer ni gestionar una conversación asignada a otro", () => {
+  const sellerA = { uid: "a", email: "a@example.com", isAdmin: false };
+  const sellerB = { uid: "b", email: "b@example.com", isAdmin: false };
+  const conversation = { assignedToUid: "a", assignedToEmail: "a@example.com", wabaPhoneId: "123" };
+  assert.equal(crmInternals.canReadConversation(sellerA, conversation, new Set(["123"])), true);
+  assert.equal(crmInternals.canManageConversation(sellerA, conversation), true);
+  assert.equal(crmInternals.canReadConversation(sellerB, conversation, new Set(["123"])), false);
+  assert.equal(crmInternals.canManageConversation(sellerB, conversation), false);
+});
